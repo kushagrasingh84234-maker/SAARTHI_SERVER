@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+supabase
+huggingface-hub
+cachetools
+python-dotenv
