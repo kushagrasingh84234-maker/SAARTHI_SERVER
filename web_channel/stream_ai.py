@@ -36,6 +36,7 @@ from config import (
     GROQ_MODEL,
     MAX_RETRIES,
     RETRY_BACKOFF_SECONDS,
+    WEB_REASONING_EFFORT,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,12 @@ _RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503})
 
 # Upper bound for honoring a Retry-After header, in seconds.
 _MAX_RETRY_AFTER_SECONDS: float = 10.0
+
+# NEW (F4): set to True the first time Groq responds HTTP 400 while the
+# "reasoning_effort" field is present. Once True, _build_payload stops
+# adding the field for the rest of the process, so we don't repeatedly
+# pay for a 400 + retry on every call.
+_reasoning_effort_unsupported: bool = False
 
 # Safe, generic messages. These never contain internal details.
 _MSG_BUSY = "The AI service is busy. Please try again in a moment."
@@ -141,7 +148,37 @@ def _build_payload(
     }
     if stream:
         payload["stream"] = True
+    # NEW (F4a): gpt-oss spends part of max_tokens on hidden reasoning before
+    # producing visible content, which can leave short completions (e.g. the
+    # search planner) with no visible output at all. WEB_REASONING_EFFORT
+    # ("" disables this) is sent as-is; once Groq has told us it rejects the
+    # field (HTTP 400), it is left out for the rest of the process.
+    if WEB_REASONING_EFFORT and not _reasoning_effort_unsupported:
+        payload["reasoning_effort"] = WEB_REASONING_EFFORT
     return payload
+
+
+def _finish_reason(data: Any) -> str:
+    """Best-effort extraction of choices[0].finish_reason for logging only."""
+    try:
+        return str(data["choices"][0].get("finish_reason"))
+    except Exception:  # noqa: BLE001 - logging helper must never raise
+        return "unknown"
+
+
+def _usage(data: Any) -> dict[str, Any]:
+    """Best-effort extraction of the token usage numbers for logging only."""
+    try:
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            return {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            }
+    except Exception:  # noqa: BLE001 - logging helper must never raise
+        pass
+    return {}
 
 
 def _build_headers(*, stream: bool) -> dict[str, str]:
@@ -177,11 +214,14 @@ async def groq_complete(
         AIServiceError: If the key is missing or the request finally fails.
     """
     headers = _build_headers(stream=False)
-    payload = _build_payload(messages, max_tokens=max_tokens, temperature=temperature, stream=False)
     attempts = _max_attempts()
 
     async with httpx.AsyncClient(timeout=_timeout(timeout)) as client:
         for attempt in range(1, attempts + 1):
+            # NEW (F4b): built per-attempt (not once before the loop) so that
+            # once _reasoning_effort_unsupported flips True, later attempts -
+            # including the very next one - stop sending the field.
+            payload = _build_payload(messages, max_tokens=max_tokens, temperature=temperature, stream=False)
             delay: float
             try:
                 response = await client.post(GROQ_API_URL, headers=headers, json=payload)
@@ -195,14 +235,51 @@ async def groq_complete(
                 delay = _backoff_delay(attempt)
             else:
                 status = response.status_code
+
+                # NEW (F4b): some gpt-oss deployments reject "reasoning_effort"
+                # with HTTP 400. Retry this one attempt immediately without
+                # the field and remember not to send it again for the rest of
+                # the process.
+                if status == 400 and "reasoning_effort" in payload:
+                    global _reasoning_effort_unsupported
+                    logger.info("Groq rejected reasoning_effort (HTTP 400); retrying without it.")
+                    _reasoning_effort_unsupported = True
+                    payload = _build_payload(
+                        messages, max_tokens=max_tokens, temperature=temperature, stream=False
+                    )
+                    try:
+                        response = await client.post(GROQ_API_URL, headers=headers, json=payload)
+                    except httpx.HTTPError as exc:
+                        logger.warning(
+                            "Groq request failed after dropping reasoning_effort (%s), attempt %d/%d",
+                            type(exc).__name__, attempt, attempts,
+                        )
+                        if attempt >= attempts:
+                            raise AIServiceError(_MSG_BUSY) from None
+                        await asyncio.sleep(_backoff_delay(attempt))
+                        continue
+                    status = response.status_code
+
                 if status == 200:
                     try:
                         data = response.json()
-                        content = data["choices"][0]["message"]["content"]
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        # Valid response but no usable content.
+                    except ValueError:
+                        # Valid HTTP response but not valid JSON.
                         return ""
-                    return content if isinstance(content, str) else ""
+                    try:
+                        content = data["choices"][0]["message"]["content"]
+                    except (KeyError, IndexError, TypeError):
+                        content = None
+                    if not isinstance(content, str) or not content.strip():
+                        # NEW (F4c): log finish_reason and token usage numbers
+                        # only when the content comes back empty - never the
+                        # message text itself.
+                        logger.info(
+                            "Groq reply had empty content (finish_reason=%s, usage=%s)",
+                            _finish_reason(data), _usage(data),
+                        )
+                        return content if isinstance(content, str) else ""
+                    return content
                 logger.warning("Groq returned HTTP %d, attempt %d/%d", status, attempt, attempts)
                 if status not in _RETRYABLE_STATUSES or attempt >= attempts:
                     raise _error_for_status(status) from None
@@ -282,17 +359,56 @@ async def groq_stream(
         AIServiceError: If the key is missing or the stream finally fails.
     """
     headers = _build_headers(stream=True)
-    payload = _build_payload(messages, max_tokens=max_tokens, temperature=temperature, stream=True)
     attempts = _max_attempts()
     yielded = False
 
     for attempt in range(1, attempts + 1):
+        # NEW (F4b): built per-attempt so a flag flip (below, or from a
+        # concurrent groq_complete call) takes effect on the next attempt.
+        payload = _build_payload(messages, max_tokens=max_tokens, temperature=temperature, stream=True)
         delay: float | None = None
         try:
             async with httpx.AsyncClient(timeout=_timeout(timeout)) as client:
                 async with client.stream("POST", GROQ_API_URL, headers=headers, json=payload) as response:
                     status = response.status_code
-                    if status != 200:
+
+                    # NEW (F4b): some gpt-oss deployments reject
+                    # "reasoning_effort" with HTTP 400. Retry this one
+                    # attempt immediately, inline, without the field, and
+                    # remember not to send it again for the rest of the
+                    # process. Only safe before any tokens have been yielded.
+                    if status == 400 and "reasoning_effort" in payload and not yielded:
+                        global _reasoning_effort_unsupported
+                        logger.info(
+                            "Groq rejected reasoning_effort on stream (HTTP 400); retrying without it."
+                        )
+                        _reasoning_effort_unsupported = True
+                        payload = _build_payload(
+                            messages, max_tokens=max_tokens, temperature=temperature, stream=True
+                        )
+                        async with client.stream(
+                            "POST", GROQ_API_URL, headers=headers, json=payload
+                        ) as retry_response:
+                            status = retry_response.status_code
+                            if status != 200:
+                                logger.warning(
+                                    "Groq stream returned HTTP %d after dropping reasoning_effort, "
+                                    "attempt %d/%d", status, attempt, attempts,
+                                )
+                                if status in _RETRYABLE_STATUSES and attempt < attempts and not yielded:
+                                    delay = _retry_delay(retry_response, attempt)
+                                else:
+                                    raise _error_for_status(status)
+                            else:
+                                async for line in retry_response.aiter_lines():
+                                    text, done = _extract_delta_text(line)
+                                    if text is not None:
+                                        yielded = True
+                                        yield text
+                                    if done:
+                                        break
+                                return
+                    elif status != 200:
                         logger.warning(
                             "Groq stream returned HTTP %d, attempt %d/%d", status, attempt, attempts
                         )
