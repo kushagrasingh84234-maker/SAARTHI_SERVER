@@ -1,462 +1,184 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import { config } from '../config'; // must expose config.apiUrl
+import asyncio
+import json
+import logging
+from typing import AsyncGenerator
 
-/* ───────────────────────── Types ───────────────────────── */
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
-export interface Source {
-  title: string;
-  url: string;
-  domain: string;
-}
+import database
 
-export interface Message {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  createdAt: number;
-  sources?: Source[];
-  streaming?: boolean;
-  error?: string;
-}
+logger = logging.getLogger(__name__)
+router = APIRouter()
 
-export interface Conversation {
-  id: string;
-  title: string;
-  messages: Message[];
-  createdAt: number;
-  updatedAt: number;
-}
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+HISTORY_COLUMNS = "id, session_id, role, content, created_at"
+HISTORY_LIMIT = 100
+MAX_MESSAGE_CHARS = 4000
 
-interface HistoryRow {
-  id: number | string;
-  role: string;
-  content: string;
-  created_at: string | number;
-}
+# Keeps references to background save tasks so they are not garbage-collected
+# before they finish.
+_background_tasks: set = set()
 
-interface HistoryResponse {
-  messages?: HistoryRow[];
-}
 
-interface ChatState {
-  conversations: Conversation[];
-  activeId: string | null;
-}
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _supabase_ready() -> bool:
+    """True only if Supabase is enabled and the client actually exists."""
+    return bool(getattr(database, "SUPABASE_ENABLED", False)) and (
+        getattr(database, "_supabase_client", None) is not None
+    )
 
-type Action =
-  | { type: 'SET_CONVERSATIONS'; payload: Conversation[] }
-  | { type: 'SELECT_CHAT'; payload: string }
-  | { type: 'NEW_CHAT'; conversationId?: string }
-  | { type: 'ADD_MESSAGES'; conversationId: string; messages: Message[] }
-  | { type: 'APPEND_TOKEN'; conversationId: string; messageId: string; text: string }
-  | { type: 'SET_SOURCES'; conversationId: string; messageId: string; sources: Source[] }
-  | { type: 'FINISH'; conversationId: string; messageId: string }
-  | { type: 'FAIL'; conversationId: string; messageId: string; error: string };
 
-/* ───────────────────────── Helpers ───────────────────────── */
+def _sse(event: str, data: dict) -> str:
+    """Format one Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-const makeId = (): string =>
-  typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-const mapHistoryRole = (role: string): 'user' | 'assistant' | null => {
-  if (role === 'user') return 'user';
-  if (role === 'model' || role === 'assistant') return 'assistant';
-  return null; // ignore anything else (e.g. system)
-};
+async def _save_turn(session_id: str, user_text: str, assistant_text: str) -> None:
+    """Best-effort save of one user/assistant turn to memory_logs.
 
-const mapHistoryToMessages = (rows: HistoryRow[]): Message[] => {
-  const result: Message[] = [];
-  for (const row of rows) {
-    const role = mapHistoryRole(row.role);
-    if (!role) continue;
-    result.push({
-      id: String(row.id),
-      role,
-      content: row.content,
-      createdAt: new Date(row.created_at).getTime(),
-    });
-  }
-  return result;
-};
+    Never raises: a database problem must not break the chat stream.
+    """
+    if not _supabase_ready():
+        return
 
-const emptyConversation = (id: string): Conversation => {
-  const now = Date.now();
-  return { id, title: 'New chat', messages: [], createdAt: now, updatedAt: now };
-};
+    client = database._supabase_client
+    rows = [{"session_id": session_id, "role": "user", "content": user_text}]
+    if assistant_text:
+        rows.append(
+            {"session_id": session_id, "role": "assistant", "content": assistant_text}
+        )
 
-const updateMessage = (
-  conversations: Conversation[],
-  conversationId: string,
-  messageId: string,
-  patch: (m: Message) => Message
-): Conversation[] =>
-  conversations.map((c) =>
-    c.id !== conversationId
-      ? c
-      : {
-          ...c,
-          updatedAt: Date.now(),
-          messages: c.messages.map((m) => (m.id === messageId ? patch(m) : m)),
-        }
-  );
+    def _insert():
+        return client.table("memory_logs").insert(rows).execute()
 
-/* ───────────────────────── Reducer ───────────────────────── */
+    try:
+        await asyncio.to_thread(_insert)
+    except Exception as e:
+        logger.error(f"Error saving chat turn for {session_id}: {e}")
 
-const initialState: ChatState = { conversations: [], activeId: null };
 
-function reducer(state: ChatState, action: Action): ChatState {
-  switch (action.type) {
-    case 'SET_CONVERSATIONS': {
-      const stillExists = action.payload.some((c) => c.id === state.activeId);
-      return {
-        conversations: action.payload,
-        activeId: stillExists ? state.activeId : null,
-      };
-    }
+def _schedule_save(session_id: str, user_text: str, assistant_text: str) -> None:
+    """Run _save_turn in the background without blocking the stream."""
+    task = asyncio.create_task(_save_turn(session_id, user_text, assistant_text))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
-    case 'SELECT_CHAT':
-      return { ...state, activeId: action.payload };
 
-    case 'NEW_CHAT': {
-      const id = action.conversationId ?? makeId();
-      const exists = state.conversations.some((c) => c.id === id);
-      return {
-        conversations: exists
-          ? state.conversations
-          : [emptyConversation(id), ...state.conversations],
-        activeId: id,
-      };
-    }
+# ---------------------------------------------------------------------------
+# Token source (PLACEHOLDER)
+# ---------------------------------------------------------------------------
+# Replace this function with your real AI streaming call (Groq, etc.).
+# It must be an async generator that yields plain text chunks (tokens).
+async def _token_source(
+    message: str, session_id: str, conversation_id: str, channel: str
+) -> AsyncGenerator[str, None]:
+    reply = f"Namaste! I am Saarthi. This is a placeholder reply to: {message}"
+    for word in reply.split(" "):
+        await asyncio.sleep(0.03)
+        yield word + " "
 
-    case 'ADD_MESSAGES':
-      return {
-        ...state,
-        conversations: state.conversations.map((c) => {
-          if (c.id !== action.conversationId) return c;
-          const firstUser = [...c.messages, ...action.messages].find(
-            (m) => m.role === 'user'
-          );
-          return {
-            ...c,
-            title: firstUser ? firstUser.content.slice(0, 40) : c.title,
-            updatedAt: Date.now(),
-            messages: [...c.messages, ...action.messages],
-          };
-        }),
-      };
 
-    case 'APPEND_TOKEN':
-      return {
-        ...state,
-        conversations: updateMessage(
-          state.conversations,
-          action.conversationId,
-          action.messageId,
-          (m) => ({ ...m, content: m.content + action.text })
-        ),
-      };
+async def generate_reply_stream(
+    message: str, session_id: str, conversation_id: str, channel: str
+) -> AsyncGenerator[str, None]:
+    """Yield SSE frames: status -> token(s) -> done (or error).
 
-    case 'SET_SOURCES':
-      return {
-        ...state,
-        conversations: updateMessage(
-          state.conversations,
-          action.conversationId,
-          action.messageId,
-          (m) => ({ ...m, sources: action.sources })
-        ),
-      };
+    The full reply is saved to the database in the background once the
+    stream ends, even if the client disconnects midway.
+    """
+    parts: list = []
+    try:
+        yield _sse("status", {"message": "Thinking..."})
 
-    case 'FINISH':
-      return {
-        ...state,
-        conversations: updateMessage(
-          state.conversations,
-          action.conversationId,
-          action.messageId,
-          (m) => ({ ...m, streaming: false })
-        ),
-      };
+        async for token in _token_source(message, session_id, conversation_id, channel):
+            parts.append(token)
+            yield _sse("token", {"text": token})
 
-    case 'FAIL':
-      // keep any partial answer that already arrived, and attach the error
-      return {
-        ...state,
-        conversations: updateMessage(
-          state.conversations,
-          action.conversationId,
-          action.messageId,
-          (m) => ({ ...m, streaming: false, error: action.error })
-        ),
-      };
+        yield _sse("done", {"conversation_id": conversation_id})
 
-    default:
-      return state;
-  }
-}
+    except asyncio.CancelledError:
+        # Client disconnected; the finally block still saves what we have.
+        raise
+    except Exception as e:
+        logger.error(f"Chat stream error for {session_id}: {e}")
+        yield _sse("error", {"message": "Something went wrong. Please try again."})
+    finally:
+        _schedule_save(session_id, message, "".join(parts).strip())
 
-/* ───────────────────────── SSE parser ───────────────────────── */
 
-interface SSEEvent {
-  event: string;
-  data: any;
-}
+# ---------------------------------------------------------------------------
+# POST /chat  (SSE stream)
+# ---------------------------------------------------------------------------
+@router.post("/chat")
+async def chat(request: Request):
+    """Main Saarthi chat endpoint. Returns a Server-Sent Events stream."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body."}, status_code=400)
 
-async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "JSON body must be an object."}, status_code=400)
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
+    message = str(payload.get("message") or "").strip()
+    session_id = str(payload.get("session_id") or "").strip()
+    conversation_id = str(payload.get("conversation_id") or "").strip() or "default"
+    channel = str(payload.get("channel") or "web").strip() or "web"
 
-      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, '\n');
+    if not message:
+        return JSONResponse({"error": "'message' is required."}, status_code=400)
+    if not session_id:
+        return JSONResponse({"error": "'session_id' is required."}, status_code=400)
+    if len(message) > MAX_MESSAGE_CHARS:
+        return JSONResponse(
+            {"error": f"'message' is too long (max {MAX_MESSAGE_CHARS} characters)."},
+            status_code=413,
+        )
 
-      let idx: number;
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const raw = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
+    return StreamingResponse(
+        generate_reply_stream(message, session_id, conversation_id, channel),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # stop proxies from buffering the stream
+        },
+    )
 
-        let event = 'message';
-        const dataLines: string[] = [];
-        for (const line of raw.split('\n')) {
-          if (line.startsWith('event:')) event = line.slice(6).trim();
-          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
-        }
-        if (dataLines.length === 0) continue;
 
-        try {
-          yield { event, data: JSON.parse(dataLines.join('\n')) };
-        } catch {
-          // ignore malformed event
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
+# ---------------------------------------------------------------------------
+# GET /history/{session_id}
+# ---------------------------------------------------------------------------
+@router.get("/history/{session_id}")
+async def get_chat_history(session_id: str):
+    """Fetch chat history for a specific session from Supabase."""
+    if not _supabase_ready():
+        return {"messages": []}
 
-/* ───────────────────────── Hook ───────────────────────── */
+    client = database._supabase_client
 
-export function useChat(authUserId: string | null | undefined) {
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [status, setStatus] = useState('');
-  const [searchQueries, setSearchQueries] = useState<string[]>([]);
-  const streamAbortRef = useRef<AbortController | null>(null);
+    def _fetch():
+        # Newest N rows (desc + limit); reversed below to chronological order.
+        return (
+            client.table("memory_logs")
+            .select(HISTORY_COLUMNS)
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(HISTORY_LIMIT)
+            .execute()
+        )
 
-  /* ── Initialization: load history from the cloud (no local storage) ── */
-  useEffect(() => {
-    // stop any running answer when the user changes or logs out
-    streamAbortRef.current?.abort();
-
-    // Logged out: clear everything
-    if (!authUserId) {
-      dispatch({ type: 'SET_CONVERSATIONS', payload: [] });
-      return;
-    }
-
-    const controller = new AbortController();
-
-    const loadHistory = async () => {
-      try {
-        const res = await fetch(
-          `${config.apiUrl}/api/history/${encodeURIComponent(authUserId)}`,
-          { signal: controller.signal }
-        );
-        if (!res.ok) {
-          throw new Error(`History request failed with status ${res.status}`);
-        }
-
-        const data: HistoryResponse = await res.json();
-        const rows = Array.isArray(data.messages) ? data.messages : [];
-        const messages = mapHistoryToMessages(rows);
-
-        if (messages.length > 0) {
-          const firstUser = messages.find((m) => m.role === 'user');
-          const conversation: Conversation = {
-            id: authUserId,
-            title: firstUser ? firstUser.content.slice(0, 40) : 'New chat',
-            messages,
-            createdAt: messages[0].createdAt,
-            updatedAt: messages[messages.length - 1].createdAt,
-          };
-          dispatch({ type: 'SET_CONVERSATIONS', payload: [conversation] });
-          dispatch({ type: 'SELECT_CHAT', payload: authUserId });
-        } else {
-          // New user: empty history
-          dispatch({ type: 'SET_CONVERSATIONS', payload: [] });
-          dispatch({ type: 'NEW_CHAT', conversationId: authUserId });
-        }
-      } catch (err) {
-        if (controller.signal.aborted) return;
-        console.error('Could not load chat history:', err);
-        // Fall back to a clean chat so the UI stays usable
-        dispatch({ type: 'SET_CONVERSATIONS', payload: [] });
-        dispatch({ type: 'NEW_CHAT', conversationId: authUserId });
-      }
-    };
-
-    loadHistory();
-    return () => controller.abort();
-  }, [authUserId]);
-
-  /* ── Send a message and stream the answer ── */
-  const sendMessage = useCallback(
-    async (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed || !authUserId || isStreaming) return;
-
-      const conversationId = state.activeId ?? authUserId;
-      if (!state.conversations.some((c) => c.id === conversationId)) {
-        dispatch({ type: 'NEW_CHAT', conversationId });
-      }
-
-      const now = Date.now();
-      const userMsg: Message = {
-        id: makeId(),
-        role: 'user',
-        content: trimmed,
-        createdAt: now,
-      };
-      const assistantMsg: Message = {
-        id: makeId(),
-        role: 'assistant',
-        content: '',
-        createdAt: now + 1,
-        streaming: true,
-      };
-      dispatch({
-        type: 'ADD_MESSAGES',
-        conversationId,
-        messages: [userMsg, assistantMsg],
-      });
-
-      const controller = new AbortController();
-      streamAbortRef.current = controller;
-      setIsStreaming(true);
-      setStatus('');
-      setSearchQueries([]);
-
-      const fail = (error: string) =>
-        dispatch({ type: 'FAIL', conversationId, messageId: assistantMsg.id, error });
-
-      try {
-        const res = await fetch(`${config.apiUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: trimmed,
-            channel: 'web',
-            session_id: authUserId,
-            conversation_id: conversationId,
-          }),
-          signal: controller.signal,
-        });
-
-        if (!res.ok || !res.body) {
-          let msg = `Request failed (${res.status})`;
-          try {
-            const j = await res.json();
-            if (j && typeof j.error === 'string') msg = j.error;
-          } catch {
-            /* body was not JSON */
-          }
-          fail(msg);
-          return;
-        }
-
-        let finished = false;
-        for await (const evt of readSSE(res.body)) {
-          switch (evt.event) {
-            case 'status':
-              setStatus(String(evt.data?.text ?? ''));
-              break;
-            case 'search':
-              if (evt.data?.query) {
-                setSearchQueries((q) => [...q, String(evt.data.query)]);
-              }
-              break;
-            case 'sources':
-              dispatch({
-                type: 'SET_SOURCES',
-                conversationId,
-                messageId: assistantMsg.id,
-                sources: Array.isArray(evt.data?.items) ? evt.data.items : [],
-              });
-              break;
-            case 'token':
-              dispatch({
-                type: 'APPEND_TOKEN',
-                conversationId,
-                messageId: assistantMsg.id,
-                text: String(evt.data?.text ?? ''),
-              });
-              break;
-            case 'done':
-              finished = true;
-              dispatch({ type: 'FINISH', conversationId, messageId: assistantMsg.id });
-              break;
-            case 'error':
-              finished = true;
-              fail(String(evt.data?.text ?? 'Something went wrong. Please try again.'));
-              break;
-          }
-        }
-
-        // stream closed without done/error
-        if (!finished) {
-          dispatch({ type: 'FINISH', conversationId, messageId: assistantMsg.id });
-        }
-      } catch (err) {
-        if (controller.signal.aborted) {
-          // user pressed Stop: keep the partial answer
-          dispatch({ type: 'FINISH', conversationId, messageId: assistantMsg.id });
-        } else {
-          console.error('Chat stream failed:', err);
-          fail('Could not reach the server. Please check your connection.');
-        }
-      } finally {
-        setIsStreaming(false);
-        setStatus('');
-        setSearchQueries([]);
-        if (streamAbortRef.current === controller) streamAbortRef.current = null;
-      }
-    },
-    [authUserId, isStreaming, state.activeId, state.conversations]
-  );
-
-  const stopStreaming = useCallback(() => {
-    streamAbortRef.current?.abort();
-  }, []);
-
-  const newChat = useCallback(() => {
-    if (!authUserId) return;
-    dispatch({ type: 'NEW_CHAT', conversationId: authUserId });
-  }, [authUserId]);
-
-  const selectChat = useCallback((id: string) => {
-    dispatch({ type: 'SELECT_CHAT', payload: id });
-  }, []);
-
-  const activeConversation =
-    state.conversations.find((c) => c.id === state.activeId) ?? null;
-
-  return {
-    conversations: state.conversations,
-    activeConversation,
-    messages: activeConversation?.messages ?? [],
-    status,
-    searchQueries,
-    isStreaming,
-    sendMessage,
-    stopStreaming,
-    newChat,
-    selectChat,
-  };
-}
+    try:
+        # The Supabase client is synchronous, so run it in a worker thread.
+        resp = await asyncio.to_thread(_fetch)
+        messages = list(reversed(resp.data or []))
+        return {"messages": messages}
+    except Exception as e:
+        logger.error(f"Error fetching history for {session_id}: {e}")
+        return JSONResponse({"messages": [], "error": True}, status_code=500)
+      
