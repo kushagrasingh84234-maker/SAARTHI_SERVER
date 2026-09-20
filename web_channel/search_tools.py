@@ -1,4 +1,4 @@
-"""Pluggable web search layer for the Studybot web chat channel.
+"""Pluggable web search layer for the Saarthi web chat channel.
 
 Supported providers (selected by ``SEARCH_PROVIDER``): ``tavily`` and
 ``serper``. Each provider lives in its own private function

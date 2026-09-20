@@ -1,4 +1,4 @@
-"""Prompt text and prompt-building helpers for the Studybot web chat channel.
+"""Prompt text and prompt-building helpers for the Saarthi web chat channel.
 
 Contents:
     WEB_SYSTEM_PROMPT       System prompt for the final (streamed) answer.
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # type use only; avoids a runtime dependency on search_tools
-    from search_tools import SearchResult
+    from web_channel.search_tools import SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ _SOURCES_TAG_RE = re.compile(r"</?\s*sources\s*>", re.IGNORECASE)
 # --- Prompts ----------------------------------------------------------------
 
 WEB_SYSTEM_PROMPT: str = (
-    "You are Studybot, a friendly, accurate and patient AI assistant for "
+    "You are Saarthi, a friendly, accurate and patient AI assistant for "
     "students and general users, chatting on a website.\n"
     "\n"
     "Language and style:\n"

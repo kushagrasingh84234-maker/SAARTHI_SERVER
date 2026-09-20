@@ -1,4 +1,4 @@
-"""Web chat endpoint for Studybot: POST /api/chat (SSE) and GET /api/health.
+"""Web chat endpoint for Saarthi: POST /api/chat (SSE) and GET /api/health.
 
 This module connects the web channel modules (sse_utils, stream_ai,
 search_tools, web_prompts) to the existing database.py / logic.py helpers.
@@ -45,6 +45,7 @@ from config import (
     WEB_MAX_CONCURRENT_STREAMS,
     WEB_MAX_MESSAGE_CHARS,
     WEB_MAX_SOURCES,
+    WEB_LOCAL_SHORTCUTS,
     WEB_MAX_TOKENS,
     WEB_PLANNER_MAX_TOKENS,
     WEB_RATE_LIMIT_PER_MIN,
@@ -58,10 +59,10 @@ from database import (
     route_and_save_bg,
 )
 from logic import handle_local_queries
-from search_tools import SearchResult, search_enabled, search_many
-from sse_utils import SSE_HEADERS, SSE_MEDIA_TYPE, sse_event
-from stream_ai import AIServiceError, groq_complete, groq_stream
-from web_prompts import (
+from web_channel.search_tools import SearchResult, search_enabled, search_many
+from web_channel.sse_utils import SSE_HEADERS, SSE_MEDIA_TYPE, sse_event
+from web_channel.stream_ai import AIServiceError, groq_complete, groq_stream
+from web_channel.web_prompts import (
     build_answer_messages,
     build_planner_messages,
     parse_planner_output,
@@ -245,6 +246,8 @@ async def _plan_search(message: str, history_key: str) -> list[str]:
             temperature=0,
             timeout=_PLANNER_TIMEOUT_SECONDS,
         )
+        if not (raw or "").strip():
+            logger.info("planner returned empty output")
         needs_search, queries = parse_planner_output(raw)
         return queries if needs_search else []
     except AIServiceError as exc:
@@ -310,7 +313,11 @@ async def _event_stream(
             yield sse_event("status", {"text": "Image understanding is not available yet."})
 
         # 1) Local shortcut (date, time, simple maths): no AI call needed.
-        local = await asyncio.to_thread(handle_local_queries, message)
+        local = (
+            await asyncio.to_thread(handle_local_queries, message)
+            if WEB_LOCAL_SHORTCUTS
+            else None
+        )
         if local is not None:
             tag, sep, text = local.partition("|")
             if not sep:

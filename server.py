@@ -19,7 +19,7 @@ from text_utils import parse_ai_reply
 from logic import handle_local_queries, run_personalized_pipeline, get_session_state
 from ai_services import call_groq
 from game_manager import handle_game_message
-from web_api import router as web_router
+from web_channel.web_api import router as web_router
 from database import (
     add_to_history, route_and_save_bg, retrieve_long_term_context,
     build_groq_messages, CHAT_HISTORY, SUPABASE_ENABLED, ADVANCED_DB_ENABLED,
@@ -166,7 +166,7 @@ if WEB_ENABLED:
 
 @app.get("/")
 async def root():
-    return {"service": "studybot", "status": "ok"}
+    return {"service": "saarthi", "status": "ok"}
 
 
 # ---- NEW: one active WebSocket per session_id ----

@@ -1,4 +1,4 @@
-"""Server-Sent Events (SSE) helpers for the Studybot web chat channel.
+"""Server-Sent Events (SSE) helpers for the Saarthi web chat channel.
 
 This module has no dependencies beyond the standard library.
 

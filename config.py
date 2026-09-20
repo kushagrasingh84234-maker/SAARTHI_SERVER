@@ -224,10 +224,10 @@ ALLOWED_ORIGINS = _env_list("ALLOWED_ORIGINS", ["*"])
 ALLOWED_ORIGIN_REGEX = (os.environ.get("ALLOWED_ORIGIN_REGEX") or "").strip() or None
 
 # Answer generation limits.
-WEB_MAX_TOKENS = _env_int("WEB_MAX_TOKENS", default=1500, min_value=100, max_value=8000)
+WEB_MAX_TOKENS = _env_int("WEB_MAX_TOKENS", default=2500, min_value=100, max_value=8000)
 WEB_TEMPERATURE = _env_float("WEB_TEMPERATURE", default=0.6, min_value=0.0, max_value=1.5)
 WEB_PLANNER_MAX_TOKENS = _env_int(
-    "WEB_PLANNER_MAX_TOKENS", default=200, min_value=50, max_value=500
+    "WEB_PLANNER_MAX_TOKENS", default=600, min_value=50, max_value=2000
 )
 
 # Request / stream protection.
@@ -255,3 +255,12 @@ SEARCH_TIMEOUT_SECONDS = _env_float(
     "SEARCH_TIMEOUT_SECONDS", default=8.0, min_value=1.0, max_value=30.0
 )
 WEB_MAX_SOURCES = _env_int("WEB_MAX_SOURCES", default=6, min_value=1, max_value=10)
+
+# Reasoning effort sent to Groq for gpt-oss models ("low", "medium", "high").
+# An empty string disables the field. Unknown values fall back to "low".
+_reasoning_raw = (os.environ.get("WEB_REASONING_EFFORT", "low") or "").strip().lower()
+WEB_REASONING_EFFORT = _reasoning_raw if _reasoning_raw in ("", "low", "medium", "high") else "low"
+
+# Local shortcuts (date, time, simple maths) on the web channel. Off by
+# default: the regex answers "what is time?" with the clock time.
+WEB_LOCAL_SHORTCUTS = _env_bool("WEB_LOCAL_SHORTCUTS", False)

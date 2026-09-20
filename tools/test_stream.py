@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Standalone test client for the Studybot web chat stream (POST /api/chat).
+"""Standalone test client for the Saarthi web chat stream (POST /api/chat).
 
 Usage (works the same in Windows PowerShell, cmd, macOS and Linux):
 
-    python test_stream.py "your message"
+    python tools/test_stream.py "your message"
 
-Test a deployed server by setting STUDYBOT_URL first.
+Test a deployed server by setting SAARTHI_URL first (STUDYBOT_URL still works).
 
-    PowerShell:  $env:STUDYBOT_URL = "https://your-service.onrender.com"
-    macOS/Linux: export STUDYBOT_URL=https://your-service.onrender.com
+    PowerShell:  $env:SAARTHI_URL = "https://your-service.onrender.com"
+    macOS/Linux: export SAARTHI_URL=https://your-service.onrender.com
 
 Each event is printed as "[event] data", so you can check the order:
 status -> [search -> sources] -> status -> token ... -> done.
@@ -49,10 +49,10 @@ def main(argv: list[str]) -> int:
 
     message = " ".join(argv[1:]).strip()
     if not message:
-        print('Usage: python test_stream.py "your message"', file=sys.stderr)
+        print('Usage: python tools/test_stream.py "your message"', file=sys.stderr)
         return 2
 
-    base_url = (os.environ.get("STUDYBOT_URL") or DEFAULT_URL).strip().rstrip("/")
+    base_url = (os.environ.get("SAARTHI_URL") or os.environ.get("STUDYBOT_URL") or DEFAULT_URL).strip().rstrip("/")
     url = f"{base_url}/api/chat"
     payload = {
         "message": message,
