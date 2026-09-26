@@ -5,3 +5,11 @@ supabase
 huggingface-hub
 cachetools
 python-dotenv
+torch
+transformers
+peft
+accelerate
+bitsandbytes
+pillow
+opencv-python-headless
+pypdf
