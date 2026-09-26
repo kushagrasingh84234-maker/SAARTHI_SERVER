@@ -307,6 +307,16 @@ except Exception:  # pragma: no cover - config should always provide this
     )
 
 try:
+    from config import ROBOT_CONTROL_SYSTEM_PROMPT, CONVERSATIONAL_SYSTEM_PROMPT
+except Exception:  # pragma: no cover - config should always provide these (Phase 4 / dual-mode)
+    ROBOT_CONTROL_SYSTEM_PROMPT = (
+        "You are SAARTHI, an embodied desktop robot assistant. "
+        "[MODE: ROBOT_CONTROL] Analyze sensor data, reason step-by-step, then "
+        "output a precise JSON action command."
+    )
+    CONVERSATIONAL_SYSTEM_PROMPT = SYSTEM_PROMPT
+
+try:
     from ai_services import call_groq as _default_ai_call
 except Exception:  # pragma: no cover - ai_services should always be importable
     _default_ai_call = None
@@ -324,6 +334,44 @@ try:
     from database import retrieve_relevant_memories as _retrieve_relevant_memories_db
 except Exception:  # pragma: no cover - database should always be importable
     _retrieve_relevant_memories_db = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: adaptive_learning integration (additive, optional, fail-safe)
+# ---------------------------------------------------------------------------
+# Imported defensively, the same pattern as emotion_engine/personality_engine
+# above: if adaptive_learning (or any of its three factories) is ever
+# unavailable, this degrades to "no adaptive adjustment" and
+# run_personalized_pipeline behaves exactly as it did before Phase 4 -
+# response_guidance is built from response_policy + Personality Engine only.
+#
+# NOTE: the exact adaptive_learning API for creating a fresh per-session
+# learning_state was not specified up front, so _get_or_create_learning_state
+# below tries a short list of plausible factory method names on
+# _learning_engine and gives up cleanly (returns None) if none of them
+# exist. Verify/adjust that helper against your actual adaptive_learning
+# package - everywhere else in this integration is defensive enough that a
+# wrong guess there just disables Phase 4 for this process, it never
+# crashes the chat pipeline (see _apply_adaptive_policy_safe below).
+try:
+    from adaptive_learning import (
+        get_learning_engine,
+        get_adaptation_engine,
+        get_adaptive_policy,
+    )
+
+    _learning_engine = get_learning_engine()
+    _adaptation_engine = get_adaptation_engine()
+    _adaptive_policy = get_adaptive_policy()
+except Exception:  # pragma: no cover - adaptive_learning (Phase 4) is optional
+    _learning_engine = None
+    _adaptation_engine = None
+    _adaptive_policy = None
+
+# Per-session_id registry of adaptive-learning state, mirroring
+# _user_profiles/_preference_profiles below (same _registry_lock, cleared
+# together in reset_session_state).
+_learning_states: Dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +443,7 @@ def reset_session_state(session_id: str) -> None:
     with _registry_lock:
         _user_profiles.pop(session_id, None)
         _preference_profiles.pop(session_id, None)
+        _learning_states.pop(session_id, None)
     conversation_memory.remove_session(session_id)
 
 
@@ -730,6 +779,177 @@ def _merge_semantic_context_into_messages(
     return new_messages
 
 
+def _get_or_create_learning_state(session_id: str):
+    """
+    Return this session's adaptive-learning state, creating one on first
+    use via whichever factory method _learning_engine actually exposes.
+    Returns None if adaptive_learning (Phase 4) isn't available, or if
+    state creation fails for any reason - callers must treat None as
+    "adaptive learning unavailable this turn" and fall back gracefully,
+    never raise.
+    """
+    if _learning_engine is None:
+        return None
+
+    with _registry_lock:
+        state = _learning_states.get(session_id)
+        if state is not None:
+            return state
+
+        state = None
+        for factory_name in ("get_or_create_state", "create_state", "new_state"):
+            factory = getattr(_learning_engine, factory_name, None)
+            if not callable(factory):
+                continue
+            try:
+                state = factory(session_id)
+            except TypeError:
+                try:
+                    state = factory()
+                except Exception:
+                    state = None
+            except Exception:
+                state = None
+            if state is not None:
+                break
+
+        _learning_states[session_id] = state
+        return state
+
+
+def _apply_adaptive_policy_safe(
+    policy,
+    session_id: str,
+    intent: str,
+) -> Dict[str, Any]:
+    """
+    Best-effort Phase 4 adaptive-learning pass over a freshly-built
+    response_policy. Runs adaptation_engine.process(learning_state) to
+    get adaptation decisions, then adaptive_policy.build(policy,
+    adaptation_decisions=decisions, intent=intent,
+    is_game_context=(intent == "GAME")) to fold them into a new policy
+    dict.
+
+    Never raises: on any failure (module unavailable, no learning_state,
+    adaptation_engine/adaptive_policy raising, or an unexpected return
+    type), this returns policy.to_dict() unchanged - the exact base
+    policy run_personalized_pipeline would have used before Phase 4 was
+    wired in.
+    """
+    base_dict = policy.to_dict()
+    if _adaptation_engine is None or _adaptive_policy is None:
+        return base_dict
+
+    try:
+        learning_state = _get_or_create_learning_state(session_id)
+        if learning_state is None:
+            return base_dict
+
+        decisions = _adaptation_engine.process(learning_state)
+        adapted = _adaptive_policy.build(
+            policy,
+            adaptation_decisions=decisions,
+            intent=intent,
+            is_game_context=(intent == "GAME"),
+        )
+        return adapted if isinstance(adapted, dict) else base_dict
+    except Exception as e:
+        logger.warning(
+            f"Adaptive learning (Phase 4) failed for session_id={session_id}, "
+            f"falling back to base response policy: {e}"
+        )
+        return base_dict
+
+
+# ---------------------------------------------------------------------------
+# Robot sensor formatting + multimodal/document message helpers (additive)
+# ---------------------------------------------------------------------------
+
+def format_robot_sensor_prompt(
+    sensor_data: Optional[Dict[str, Any]] = None,
+    user_message: Optional[str] = None,
+) -> str:
+    """
+    Format a robot's sensor readings into the "[SENSOR: key = value]"
+    block ROBOT_CONTROL_SYSTEM_PROMPT expects, e.g.:
+
+        [SENSOR: camera_vla = USER_DETECTED (est. 60cm)]
+
+        [SENSOR: tof_obstacle_sensor = MEASURING (58cm)]
+
+        User: <user_message or 'None'>
+
+    Each "[SENSOR: ...]" line (and the final "User: ..." line) is
+    separated from the next by a blank line (\\n\\n).
+
+    Idempotent: if `sensor_data` is empty/None and `user_message` already
+    looks like it was pre-formatted this way (starts with "[SENSOR:"),
+    `user_message` is returned unchanged instead of being wrapped again.
+
+    Pure function: no I/O, no session/global state - safe to call from
+    anywhere, including concurrently across sessions.
+    """
+    if not sensor_data and isinstance(user_message, str) and user_message.lstrip().startswith("[SENSOR:"):
+        return user_message
+
+    parts = [f"[SENSOR: {key} = {value}]" for key, value in (sensor_data or {}).items()]
+    parts.append(f"User: {user_message if user_message else 'None'}")
+    return "\n\n".join(parts)
+
+
+def _set_system_prompt(messages: List[dict], system_prompt: str) -> List[dict]:
+    """
+    Return a new messages list with the system message's content
+    replaced by `system_prompt` (or one inserted at the front if none
+    exists). Never mutates the caller's list. Used to switch between
+    ROBOT_CONTROL_SYSTEM_PROMPT and whatever the caller's own
+    build_messages_fn / _default_build_messages already put there, so
+    style guidance never leaks into the robot's strict [ACTION] JSON
+    output.
+    """
+    new_messages = list(messages)
+    if new_messages and isinstance(new_messages[0], dict) and new_messages[0].get("role") == "system":
+        replaced = dict(new_messages[0])
+        replaced["content"] = system_prompt
+        new_messages[0] = replaced
+    else:
+        new_messages.insert(0, {"role": "system", "content": system_prompt})
+    return new_messages
+
+
+def _merge_document_context_into_messages(
+    messages: List[dict],
+    document_text: Optional[str],
+) -> List[dict]:
+    """
+    Fold an attached document's extracted text into the outgoing message
+    list's system message (creating one if none exists), labeled clearly
+    as "Attached document context:" so it's never confused with the
+    user's own words. Mirrors _merge_semantic_context_into_messages's own
+    merge behavior (append, never overwrite) so document context, semantic
+    memory, and mode-specific system prompts all compose safely regardless
+    of call order. Never mutates the caller's list; a no-op when there is
+    no document_text.
+
+    NOTE: media_processor.process_document already truncates document_text
+    to DOC_MAX_EXTRACTED_CHARS before it ever reaches this function, so no
+    additional length capping is applied here.
+    """
+    if not document_text or not str(document_text).strip():
+        return messages
+
+    block = f"Attached document context:\n{str(document_text).strip()}"
+    new_messages = list(messages)
+    if new_messages and isinstance(new_messages[0], dict) and new_messages[0].get("role") == "system":
+        merged = dict(new_messages[0])
+        existing_content = merged.get("content", "") or ""
+        merged["content"] = f"{existing_content}\n\n{block}".strip()
+        new_messages[0] = merged
+    else:
+        new_messages.insert(0, {"role": "system", "content": block})
+    return new_messages
+
+
 def _default_build_messages(session_id: str, user_message: str) -> List[dict]:
     """
     Minimal, dependency-free message builder used only when the caller
@@ -751,19 +971,33 @@ def _default_build_messages(session_id: str, user_message: str) -> List[dict]:
 async def _invoke_ai(
     ai_call_fn: Callable[..., Any],
     messages: List[dict],
-    response_policy: Dict[str, Any],
+    response_policy: Optional[Dict[str, Any]],
+    images: Optional[List[Any]] = None,
+    video_frames: Optional[List[Any]] = None,
+    mode: str = "conversational",
 ) -> str:
     """
     Call the AI provider function, passing the structured response
-    policy if the callable supports it, and falling back gracefully
-    to the original (messages-only) signature otherwise - so this
-    still works with any caller-supplied AI function that hasn't been
-    upgraded to accept response_policy.
+    policy, media attachments, and mode if the callable supports them.
+    Falls back gracefully through progressively simpler signatures for
+    any caller-supplied ai_call_fn that hasn't been upgraded to accept
+    these newer keywords - so this still works with the original
+    `ai_call_fn(messages, response_policy=...)` contract, and even with
+    a bare `ai_call_fn(messages)` callable.
     """
     try:
-        return await ai_call_fn(messages, response_policy=response_policy)
+        return await ai_call_fn(
+            messages,
+            response_policy=response_policy,
+            images=images,
+            video_frames=video_frames,
+            mode=mode,
+        )
     except TypeError:
-        return await ai_call_fn(messages)
+        try:
+            return await ai_call_fn(messages, response_policy=response_policy)
+        except TypeError:
+            return await ai_call_fn(messages)
 
 
 async def run_personalized_pipeline(
@@ -771,6 +1005,11 @@ async def run_personalized_pipeline(
     session_id: str,
     build_messages_fn: Optional[Callable[[str, str], List[dict]]] = None,
     ai_call_fn: Optional[Callable[..., Any]] = None,
+    images: Optional[List[Any]] = None,
+    video_frames: Optional[List[Any]] = None,
+    document_text: Optional[str] = None,
+    sensor_data: Optional[Dict[str, Any]] = None,
+    mode: str = "conversational",
 ) -> Optional[Dict[str, Any]]:
     """
     New pipeline (additive; does not replace anything):
@@ -826,6 +1065,28 @@ async def run_personalized_pipeline(
         propagates to the caller so existing error handling in server.py
         (e.g. its try/except around call_groq) continues to apply
         unchanged.
+    images: optional list of raw bytes / base64 strings / PIL.Image
+        objects to attach (validated/compressed by media_processor.py
+        inside ai_services.call_groq before reaching the model).
+    video_frames: optional list of video frames, same accepted types as
+        `images`.
+    document_text: optional extracted document text (already truncated
+        by media_processor.process_document) folded into the outgoing
+        system message as "Attached document context:\\n...".
+    sensor_data: optional dict of robot sensor readings (e.g.
+        {"tof_obstacle_sensor": "MEASURING (58cm)", ...}). Supplying this
+        - or passing mode="robot_control" - switches this call into
+        robot-control mode: `user_message` is run through
+        format_robot_sensor_prompt(sensor_data, user_message) before
+        anything else, the outgoing system prompt becomes
+        ROBOT_CONTROL_SYSTEM_PROMPT (replacing whatever build_messages_fn
+        / the default builder would otherwise use), and no
+        response_guidance (style/tone instructions) is sent to the model,
+        so nothing interferes with its strict [ACTION] JSON output.
+    mode: "conversational" (default) or "robot_control". Backward
+        compatible: existing callers that never pass sensor_data and
+        never set mode see byte-for-byte identical behavior to before
+        this parameter existed.
 
     Returns
     -------
@@ -838,7 +1099,15 @@ async def run_personalized_pipeline(
     `personality`, `response_guidance`, and `semantic_memory` are new,
     additive keys.
     """
-    if not user_message or not user_message.strip():
+    if not user_message and not sensor_data:
+        return None
+
+    is_robot_mode = (mode == "robot_control") or bool(sensor_data)
+    effective_user_message = (
+        format_robot_sensor_prompt(sensor_data, user_message) if is_robot_mode else user_message
+    )
+
+    if not effective_user_message or not str(effective_user_message).strip():
         return None
 
     ai_call_fn = ai_call_fn or _default_ai_call
@@ -860,9 +1129,9 @@ async def run_personalized_pipeline(
         # - it is never passed into personalize(), build_response_policy(),
         # analyze_emotion(), or build_personality(), so it can never
         # influence routing, policy, emotion, or personality decisions.
-        routed_intent_probe = route_intent(user_message).intent
+        routed_intent_probe = route_intent(effective_user_message).intent
         semantic_memories = await _retrieve_semantic_memory_safe(
-            user_message, session_id, routed_intent_probe
+            effective_user_message, session_id, routed_intent_probe
         )
         recent_short_term_texts = [
             turn.get("content", "")
@@ -873,7 +1142,7 @@ async def run_personalized_pipeline(
         )
 
         personalization_result = personalize(
-            message=user_message,
+            message=effective_user_message,
             user_profile=user_profile,
             preference_profile=preference_profile,
             context=context,
@@ -894,6 +1163,15 @@ async def run_personalized_pipeline(
             context=policy_context,
         )
 
+        # --- Phase 4: adaptive_learning (additive, optional) ------------
+        # Best-effort adjustment of the base response_policy using this
+        # session's learning_state + adaptation_engine's decisions. Falls
+        # back to policy.to_dict() unchanged on any failure - see
+        # _apply_adaptive_policy_safe's own docstring.
+        adaptive_policy_dict = _apply_adaptive_policy_safe(
+            policy, session_id, personalization_result.intent
+        )
+
         # --- Emotion Engine + Personality Engine -----------------------
         # Additive turn-level signals layered on top of the existing
         # intent/personalization/response_policy result. Both are
@@ -902,7 +1180,7 @@ async def run_personalized_pipeline(
         # (response_policy's own tone/length/instructions, unassisted).
         # Neither is ever allowed to change `personalization_result.intent`
         # - it is only ever passed to them read-only, for style context.
-        emotion_result = _analyze_emotion_safe(user_message)
+        emotion_result = _analyze_emotion_safe(effective_user_message)
         personality_decision = _decide_personality_safe(
             emotion_result=emotion_result,
             intent=personalization_result.intent,
@@ -911,22 +1189,37 @@ async def run_personalized_pipeline(
             conversation_depth=context.turns_in_session,
         )
 
-        response_guidance = _combine_response_guidance(
-            policy.to_dict(), personality_decision, emotion_result
+        # Robot-control turns (mode="robot_control" or sensor_data given)
+        # never get style/tone guidance folded into the prompt - it would
+        # only interfere with the model's strict [ACTION] JSON output.
+        response_guidance = (
+            None
+            if is_robot_mode
+            else _combine_response_guidance(adaptive_policy_dict, personality_decision, emotion_result)
         )
 
         conversation_memory.add_message(
-            session_id, user_message, intent=personalization_result.intent
+            session_id, effective_user_message, intent=personalization_result.intent
         )
 
         messages = (
-            build_messages_fn(session_id, user_message)
+            build_messages_fn(session_id, effective_user_message)
             if build_messages_fn is not None
-            else _default_build_messages(session_id, user_message)
+            else _default_build_messages(session_id, effective_user_message)
         )
+        if is_robot_mode:
+            messages = _set_system_prompt(messages, ROBOT_CONTROL_SYSTEM_PROMPT)
         messages = _merge_semantic_context_into_messages(messages, semantic_context_text)
+        messages = _merge_document_context_into_messages(messages, document_text)
 
-        raw_reply = await _invoke_ai(ai_call_fn, messages, response_guidance)
+        raw_reply = await _invoke_ai(
+            ai_call_fn,
+            messages,
+            response_guidance,
+            images=images,
+            video_frames=video_frames,
+            mode=mode,
+        )
 
         conversation_memory.add_response(
             session_id, raw_reply, intent=personalization_result.intent

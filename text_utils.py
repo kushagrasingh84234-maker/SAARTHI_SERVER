@@ -1,3 +1,4 @@
+import json
 import re
 from config import MAX_DISPLAY_CHARS, DEFAULT_TAG, VALID_TAGS
 
@@ -118,10 +119,234 @@ def _truncate_preserving_words(text: str, limit: int) -> str:
         truncated = truncated[:last_space]
     return truncated.rstrip(' ,.;:') + "..."
 
+# ===========================================================================
+# NEW: structured [MODE: ROBOT_CONTROL] / [MODE: CONVERSATIONAL] output
+# ===========================================================================
+#
+# Our fine-tuned saarthi_v2_perfect model can now emit a structured,
+# 3-part reply instead of a single "TAG|text" line:
+#
+#   [INTENT_ANALYSIS]
+#   ...
+#   [REASONING_STEPS]
+#   ...
+#   [ACTION]
+#   {"schema": "motor_control", "payload": {...}}
+#
+# ...or, in [MODE: CONVERSATIONAL], the same [INTENT_ANALYSIS]/
+# [REASONING_STEPS] preamble followed directly by a plain user-facing
+# paragraph (no [ACTION] block), separated from the reasoning by a blank
+# line. parse_saarthi_structured_output() below understands both shapes,
+# as well as a plain conversational reply or a legacy "TAG|text" reply
+# with no structured markers at all.
+
+_SECTION_MARKERS = ("[INTENT_ANALYSIS]", "[REASONING_STEPS]", "[ACTION]")
+
+# tft_display action payload -> screen emotion tag. NOTE: some of these
+# (HAPPY, CURIOUS, CALM) are NOT in VALID_TAGS/DEFAULT_TAG's legacy set -
+# they're new tags for the saarthi_v2_perfect robot's own TFT firmware.
+# Verify your ESP32/TFT firmware understands these before relying on them;
+# if it only understands the legacy VALID_TAGS set, narrow this map down
+# to tags that are also in VALID_TAGS.
+_TFT_DISPLAY_TO_EMOTION = {
+    "show_happy_eyes": "HAPPY",
+    "show_curious_eyes": "CURIOUS",
+    "show_focused_eyes": "THINKING",
+    "show_battery_critical_eyes": "SAD",
+    "show_alert_eyes": "SHOCKED",
+    "show_calm_eyes": "CALM",
+}
+_KNOWN_EMOTION_TAGS = VALID_TAGS | set(_TFT_DISPLAY_TO_EMOTION.values())
+
+_JSON_FENCE_RE = re.compile(r'^```(?:json)?\s*|\s*```\s*$', re.IGNORECASE)
+
+
+def _extract_sections(raw_reply: str) -> dict:
+    """Split raw_reply on whichever of _SECTION_MARKERS are present, in
+    the order they actually appear, and return {marker: content} for each
+    one found. A marker absent from raw_reply is simply absent from the
+    returned dict."""
+    positions = [(raw_reply.find(marker), marker) for marker in _SECTION_MARKERS if marker in raw_reply]
+    positions.sort()
+    sections = {}
+    for i, (start, marker) in enumerate(positions):
+        content_start = start + len(marker)
+        content_end = positions[i + 1][0] if i + 1 < len(positions) else len(raw_reply)
+        sections[marker] = raw_reply[content_start:content_end].strip()
+    return sections
+
+
+def _parse_action_json(action_raw: str):
+    """Best-effort parse of the JSON object following [ACTION]. Tolerates
+    an optional ```json ... ``` markdown fence and trailing text after the
+    JSON object by using json.JSONDecoder().raw_decode instead of a plain
+    json.loads. Returns None (never raises) if no JSON object can be
+    found."""
+    if not action_raw:
+        return None
+    text = _JSON_FENCE_RE.sub('', action_raw.strip()).strip()
+    start = text.find('{')
+    if start == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _friendly_status_from_action(intent_analysis: str, action: dict) -> str:
+    """Derive a short, friendly status string for the TFT screen when a
+    [MODE: ROBOT_CONTROL] reply has no separate spoken text of its own -
+    just [INTENT_ANALYSIS]/[REASONING_STEPS]/[ACTION]. Prefers a short
+    excerpt of intent_analysis; falls back to describing the action
+    payload; never raises and never returns an empty string."""
+    if intent_analysis:
+        first_line = intent_analysis.strip().splitlines()[0].strip()
+        first_sentence = first_line.split('.')[0].strip()
+        if first_sentence:
+            return first_sentence
+
+    payload = action.get("payload") if isinstance(action, dict) else None
+    if isinstance(payload, dict):
+        parts = []
+        tft_display = payload.get("tft_display")
+        if isinstance(tft_display, str) and tft_display.strip():
+            parts.append(tft_display.replace("show_", "").replace("_", " ").strip())
+        speaker = payload.get("speaker")
+        if isinstance(speaker, str) and speaker.strip():
+            parts.append(speaker.replace("_", " ").strip())
+        if parts:
+            return "On it - " + ", ".join(parts) + "."
+
+    return "Okay, on it!"
+
+
+def _resolve_emotion_tag(raw_reply: str, action) -> str:
+    """Resolve the screen emotion tag: action["payload"]["tft_display"]
+    (mapped through _TFT_DISPLAY_TO_EMOTION) takes priority; otherwise a
+    leading "TAG|" prefix on raw_reply is honored if it names a known tag;
+    otherwise DEFAULT_TAG."""
+    if isinstance(action, dict):
+        payload = action.get("payload")
+        if isinstance(payload, dict):
+            tft_display = payload.get("tft_display")
+            if isinstance(tft_display, str):
+                mapped = _TFT_DISPLAY_TO_EMOTION.get(tft_display.strip())
+                if mapped:
+                    return mapped
+
+    stripped = raw_reply.lstrip()
+    if "|" in stripped:
+        potential_tag, _, _ = stripped.partition("|")
+        potential_tag = potential_tag.strip().upper()
+        if potential_tag in _KNOWN_EMOTION_TAGS:
+            return potential_tag
+
+    return DEFAULT_TAG
+
+
+def parse_saarthi_structured_output(raw_reply: str) -> dict:
+    """Parse a saarthi_v2_perfect reply that may contain [INTENT_ANALYSIS],
+    [REASONING_STEPS], and/or [ACTION] sections, a plain conversational
+    reply, or a legacy "TAG|text" reply.
+
+    Returns a dict with:
+        intent_analysis: str content under [INTENT_ANALYSIS], or "".
+        reasoning_steps:  str content under [REASONING_STEPS], or "".
+        action:           parsed dict from the [ACTION] JSON, or None.
+        spoken_text:      the user-facing reply text, with no internal
+                           reasoning headers or raw JSON leaked into it.
+        display_text:     spoken_text run through the same
+                           strip_markdown/format_symbols/ASCII-safe/
+                           _truncate_preserving_words pipeline parse_ai_reply
+                           already uses, capped at MAX_DISPLAY_CHARS.
+        emotion:          the resolved screen emotion tag (see
+                           _resolve_emotion_tag).
+    """
+    raw_reply = raw_reply or ""
+    sections = _extract_sections(raw_reply)
+
+    intent_analysis = sections.get("[INTENT_ANALYSIS]", "")
+    reasoning_steps = sections.get("[REASONING_STEPS]", "")
+    action_raw = sections.get("[ACTION]", "")
+    action = _parse_action_json(action_raw) if action_raw else None
+
+    spoken_text = ""
+
+    if sections:
+        if action_raw:
+            # [MODE: ROBOT_CONTROL]: [REASONING_STEPS]'s content is pure
+            # reasoning - the JSON action is already isolated as `action`.
+            pass
+        elif reasoning_steps:
+            # [MODE: CONVERSATIONAL]: the model writes straight from
+            # [REASONING_STEPS] into its final paragraph, separated by a
+            # blank line. Split on the FIRST blank line so the bullet/
+            # numbered reasoning never leaks into what the screen shows.
+            reasoning_part, sep, spoken_part = reasoning_steps.partition("\n\n")
+            reasoning_steps = reasoning_part.strip()
+            spoken_text = spoken_part.strip() if sep else ""
+        elif intent_analysis:
+            # Only [INTENT_ANALYSIS] present: apply the same split there.
+            intent_part, sep, spoken_part = intent_analysis.partition("\n\n")
+            intent_analysis = intent_part.strip()
+            spoken_text = spoken_part.strip() if sep else ""
+
+        if not spoken_text and action is not None:
+            spoken_text = _friendly_status_from_action(intent_analysis, action)
+    else:
+        # No structured markers at all: plain conversational reply, or a
+        # legacy "TAG|text" reply - strip a legacy tag prefix if present.
+        text = raw_reply.strip()
+        if "|" in text:
+            potential_tag, _, remainder = text.partition("|")
+            if potential_tag.strip().upper() in VALID_TAGS:
+                text = remainder.strip()
+        spoken_text = text
+
+    if not spoken_text:
+        spoken_text = intent_analysis or reasoning_steps
+
+    emotion = _resolve_emotion_tag(raw_reply, action)
+
+    display_text = strip_markdown(spoken_text)
+    display_text = format_symbols(display_text)
+    display_text = display_text.replace('–', '-').replace('—', '-').replace('−', '-')
+    display_text = display_text.encode('ascii', 'ignore').decode('ascii')
+    display_text = _CONTROL_CHAR_RE.sub('', display_text)
+    display_text = _truncate_preserving_words(display_text, MAX_DISPLAY_CHARS)
+
+    return {
+        "intent_analysis": intent_analysis,
+        "reasoning_steps": reasoning_steps,
+        "action": action,
+        "spoken_text": spoken_text,
+        "display_text": display_text,
+        "emotion": emotion,
+    }
+
+
 def parse_ai_reply(raw_reply: str) -> str:
     raw_reply = (raw_reply or "").strip()
     if not raw_reply:
         return "SAD|I didn't get a response, please try again."
+
+    # NEW: structured saarthi_v2_perfect output. If none of
+    # [INTENT_ANALYSIS]/[REASONING_STEPS]/[ACTION] are present, fall through
+    # unchanged to the exact legacy "TAG|text" parsing below.
+    if any(marker in raw_reply for marker in _SECTION_MARKERS):
+        structured = parse_saarthi_structured_output(raw_reply)
+        emotion = structured["emotion"]
+        text = structured["display_text"]
+        if not text or not text.strip(' |'):
+            text = "I couldn't format a clean answer for that one."
+        # Re-truncate if needed so "{emotion}|{text}" (not text alone) still
+        # fits the same MAX_DISPLAY_CHARS budget the legacy path enforces.
+        text_budget = max(MAX_DISPLAY_CHARS - len(emotion) - 1, 20)
+        text = _truncate_preserving_words(text, text_budget)
+        return f"{emotion}|{text}"
+
     tag = DEFAULT_TAG
     text = raw_reply
     if "|" in raw_reply:
