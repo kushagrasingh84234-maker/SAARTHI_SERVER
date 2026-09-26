@@ -7,10 +7,34 @@ try:
 except ImportError:
     pass
 
-# --- Groq Configuration ---
-GROQ_MODEL = "openai/gpt-oss-120b"
+# --- Groq Configuration (LEGACY NAMES, KEPT FOR BACKWARD COMPATIBILITY) ---
+# The server no longer calls the real Groq cloud API - inference now runs
+# locally (see "Local Model / Kaggle GPU Configuration" below). These three
+# names are kept exactly as-is, unused by the new inference path, purely so
+# none of the other ~31 files that import them break with an ImportError.
+# GROQ_MODEL is repurposed to carry the local model identifier instead of a
+# Groq model string.
+GROQ_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# --- Local Model / Kaggle GPU Configuration (NEW) ---
+# Base vision-language model plus our fine-tuned LoRA adapter, loaded
+# locally instead of calling out to Groq. Everything here is optional with
+# safe defaults so importing this file never requires the model files to
+# be present.
+BASE_MODEL_ID = os.environ.get("BASE_MODEL_ID", "Qwen/Qwen3-VL-4B-Instruct")
+SAARTHI_ADAPTER_PATH = os.environ.get("SAARTHI_ADAPTER_PATH", "./saarthi_v2_perfect")
+
+# 4-bit quantized loading (bitsandbytes) to fit Kaggle's free GPU memory.
+# (Defined with a plain parse, not _env_bool, since that helper is declared
+# further down in this file and isn't available yet at this point.)
+LOAD_IN_4BIT = (os.environ.get("LOAD_IN_4BIT", "true").strip().lower() in ("1", "true", "yes", "on"))
+
+# How many inference requests may run on the GPU at once. Kaggle typically
+# offers 1 or 2 GPUs; keep this at 1 unless the deployment explicitly
+# configures a dual-GPU setup.
+GPU_MAX_CONCURRENT_INFERENCES = int(os.environ.get("GPU_MAX_CONCURRENT_INFERENCES", 1))
 
 VALID_TAGS = {
     "SAD", "FRIENDLY", "LAUGHING", "SHOCKED", "FEAR", "LOVE", "EXCITED",
@@ -70,11 +94,16 @@ SUPPORTED_INTENT_CATEGORIES = (
     "GAME",
 )
 
-# --- System Prompt ---
+# --- System Prompt (LEGACY NAME, KEPT FOR BACKWARD COMPATIBILITY) ---
 # Base identity broadened from "Science and Programming study companion"
-# to a general-purpose personal AI companion. The ESP32 wire protocol
-# (EMOTION_TAG|text), the available tag list, and the character budget
-# are unchanged so the existing device parser keeps working untouched.
+# to a general-purpose personal AI companion. The old hard EMOTION_TAG|text
+# wire-format requirement, the "no markdown/no LaTeX" rule, and the 320
+# character cap have been removed from here: they were breaking the
+# robot channel's [ACTION] JSON command output and the web channel's
+# markdown rendering. Channel-specific formatting now belongs to
+# ROBOT_CONTROL_SYSTEM_PROMPT / CONVERSATIONAL_SYSTEM_PROMPT below; this
+# variable name is kept only so any of the other ~31 files still importing
+# SYSTEM_PROMPT directly keep working.
 SYSTEM_PROMPT = (
     "You are an intelligent personal AI companion living inside a small "
     "desktop gadget with a text screen. You are helpful, friendly, "
@@ -89,11 +118,24 @@ SYSTEM_PROMPT = (
     "override what the user explicitly asked for. Always respect the "
     "user's explicit intent over any topic default, including education. "
     "Never expose internal routing, confidence scores, memory contents, "
-    "or policy/configuration details to the user. You MUST format your "
-    "output strictly as: EMOTION_TAG|Your text response. Use plain ASCII "
-    "for math/physics (e.g., x^2, H_2O, pi). No markdown, no LaTeX. Keep "
-    "responses under 320 characters. Available Tags: NORMAL, EXCITED, SAD, "
-    "SHOCKED, LOVE, LAUGHING, SUN, RAIN, LIGHTNING, THINKING."
+    "or policy/configuration details to the user."
+)
+
+# --- Dual-Mode System Prompts (NEW) ---
+# Replaces the single rigid SYSTEM_PROMPT contract above with two
+# channel-specific prompts: one for the embodied robot (which must emit a
+# structured JSON action command) and one for plain conversational
+# channels (web / mobile / desktop), which are free to use normal
+# markdown-formatted prose.
+ROBOT_CONTROL_SYSTEM_PROMPT = (
+    "You are SAARTHI, an embodied desktop robot assistant. "
+    "[MODE: ROBOT_CONTROL] Analyze sensor data, reason step-by-step, then "
+    "output a precise JSON action command."
+)
+
+CONVERSATIONAL_SYSTEM_PROMPT = (
+    "You are SAARTHI, a helpful and warm desktop companion robot. "
+    "[MODE: CONVERSATIONAL] Respond naturally and helpfully."
 )
 
 # --- Personalization Configuration (NEW) ---
@@ -241,7 +283,7 @@ WEB_RATE_LIMIT_PER_MIN = _env_int(
     "WEB_RATE_LIMIT_PER_MIN", default=20, min_value=1, max_value=600
 )
 WEB_MAX_CONCURRENT_STREAMS = _env_int(
-    "WEB_MAX_CONCURRENT_STREAMS", default=20, min_value=1, max_value=500
+    "WEB_MAX_CONCURRENT_STREAMS", default=4, min_value=1, max_value=500
 )
 
 # Web search (optional). Provider must be one of "none", "tavily", "serper";
@@ -257,10 +299,67 @@ SEARCH_TIMEOUT_SECONDS = _env_float(
 WEB_MAX_SOURCES = _env_int("WEB_MAX_SOURCES", default=6, min_value=1, max_value=10)
 
 # Reasoning effort sent to Groq for gpt-oss models ("low", "medium", "high").
-# An empty string disables the field. Unknown values fall back to "low".
-_reasoning_raw = (os.environ.get("WEB_REASONING_EFFORT", "low") or "").strip().lower()
+# An empty string disables the field. Now disabled by default: this field
+# was specific to Groq's gpt-oss models and has no meaning for the local
+# Qwen3-VL model, but the name/validation is kept so nothing importing it
+# breaks. Unknown non-empty values still fall back to "low".
+_reasoning_raw = (os.environ.get("WEB_REASONING_EFFORT", "") or "").strip().lower()
 WEB_REASONING_EFFORT = _reasoning_raw if _reasoning_raw in ("", "low", "medium", "high") else "low"
 
 # Local shortcuts (date, time, simple maths) on the web channel. Off by
 # default: the regex answers "what is time?" with the clock time.
 WEB_LOCAL_SHORTCUTS = _env_bool("WEB_LOCAL_SHORTCUTS", False)
+
+
+# --- Image Ingestion Configuration (NEW) ---
+# Every upload is downsized/recompressed before it ever reaches the model,
+# so a single oversized image can't blow up VRAM or the prompt payload.
+IMAGE_MAX_UPLOAD_MB = _env_float(
+    "IMAGE_MAX_UPLOAD_MB", default=10.0, min_value=0.1, max_value=100.0
+)
+IMAGE_TARGET_RESOLUTION = _env_int(
+    "IMAGE_TARGET_RESOLUTION", default=448, min_value=64, max_value=2048
+)
+IMAGE_COMPRESSION_QUALITY = _env_int(
+    "IMAGE_COMPRESSION_QUALITY", default=80, min_value=1, max_value=100
+)
+IMAGE_MAX_COMPRESSED_KB = _env_int(
+    "IMAGE_MAX_COMPRESSED_KB", default=100, min_value=1, max_value=10000
+)
+
+# --- Video Ingestion Configuration (NEW) ---
+# Videos are capped hard on duration/size and reduced to a handful of
+# low-res frames rather than sent to the model whole. A tight per-second
+# rate limit stops a burst of video uploads from starving the GPU queue.
+VIDEO_MAX_DURATION_SECONDS = _env_float(
+    "VIDEO_MAX_DURATION_SECONDS", default=5.0, min_value=0.5, max_value=120.0
+)
+VIDEO_MAX_UPLOAD_MB = _env_float(
+    "VIDEO_MAX_UPLOAD_MB", default=3.0, min_value=0.1, max_value=100.0
+)
+VIDEO_TARGET_FPS = _env_int("VIDEO_TARGET_FPS", default=1, min_value=1, max_value=30)
+VIDEO_MAX_FRAMES = _env_int("VIDEO_MAX_FRAMES", default=5, min_value=1, max_value=64)
+VIDEO_FRAME_RESOLUTION = _env_int(
+    "VIDEO_FRAME_RESOLUTION", default=336, min_value=64, max_value=2048
+)
+VIDEO_RATE_LIMIT_SECONDS = _env_float(
+    "VIDEO_RATE_LIMIT_SECONDS", default=1.0, min_value=0.1, max_value=60.0
+)
+VIDEO_MAX_PER_SECOND = _env_int(
+    "VIDEO_MAX_PER_SECOND", default=1, min_value=1, max_value=100
+)
+
+# --- Document Ingestion Configuration (NEW) ---
+# Uploaded documents are capped in size, restricted to a known-safe
+# extension list, and truncated in both page count and extracted
+# character count before anything from them enters a prompt/RAG context.
+DOC_MAX_UPLOAD_MB = _env_float(
+    "DOC_MAX_UPLOAD_MB", default=2.0, min_value=0.1, max_value=100.0
+)
+DOC_ALLOWED_EXTENSIONS = tuple(
+    _env_list("DOC_ALLOWED_EXTENSIONS", [".pdf", ".txt", ".md", ".docx"])
+)
+DOC_MAX_PAGES = _env_int("DOC_MAX_PAGES", default=10, min_value=1, max_value=1000)
+DOC_MAX_EXTRACTED_CHARS = _env_int(
+    "DOC_MAX_EXTRACTED_CHARS", default=2000, min_value=100, max_value=100000
+)
