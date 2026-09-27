@@ -152,7 +152,7 @@ async def lifespan(app: FastAPI):
     # for model/adapter loading on top of its own latency. Never allowed
     # to crash startup - if the preload itself fails for any reason, the
     # server still starts and the model simply lazy-loads on first use.
-    if os.environ.get("PRELOAD_MODEL_ON_STARTUP", "false").strip().lower() in ("1", "true", "yes"):
+    if os.environ.get("PRELOAD_MODEL_ON_STARTUP", "true").strip().lower() in ("1", "true", "yes"):
         logger.info("PRELOAD_MODEL_ON_STARTUP is set - warming up the Saarthi model now.")
         try:
             await asyncio.to_thread(load_saarthi_model)
@@ -248,7 +248,8 @@ async def _run_ai_pipeline(
     # long_term_context so logic.py's pipeline never has to perform its
     # own blocking Supabase lookup inside the event loop.
     def _build_messages(sid: str, _msg: str):
-        return build_groq_messages(long_term_context, sid)
+        msgs = build_groq_messages(long_term_context, sid)
+        return _apply_robot_context_to_messages(msgs, _msg, sensor_data, document_text, mode)
 
     if PERSONALIZATION_ENABLED:
         try:
@@ -428,7 +429,12 @@ async def _process_chat_message(
             return _ensure_full_response_shape({"type": "response", "emotion": emotion, "text": text})
 
     long_term_context = await asyncio.to_thread(retrieve_long_term_context, user_message, session_id)
-    await asyncio.to_thread(add_to_history, "user", user_message, session_id)
+    effective_user_msg = (
+        format_robot_sensor_prompt(sensor_data, user_message)
+        if (mode == "robot_control" or sensor_data)
+        else user_message
+    )
+    await asyncio.to_thread(add_to_history, "user", effective_user_msg, session_id)
 
     # NEW: response_cache is keyed on (session_id, user_message text) -
     # meaningless (and dangerous) for a robot-control/media turn, where

@@ -440,8 +440,15 @@ def _build_model_inputs(messages: List[dict], processor):
     """Shared helper: turn a (policy + media applied) messages list into
     tokenized model inputs on the right device, for both call_groq and
     stream_saarthi_model."""
+    normalized_msgs = []
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            normalized_msgs.append({"role": m.get("role", "user"), "content": [{"type": "text", "text": c}]})
+        else:
+            normalized_msgs.append(m)
     prompt_text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        normalized_msgs, tokenize=False, add_generation_prompt=True
     )
     media_images = _extract_content_images(messages)
     return processor(text=[prompt_text], images=media_images or None, return_tensors="pt")
