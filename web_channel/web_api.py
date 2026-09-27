@@ -25,6 +25,7 @@ logged.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import re
@@ -32,7 +33,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from contextlib import aclosing
-from typing import AsyncIterator, Literal, Optional
+from typing import Any, AsyncIterator, Literal, Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -61,6 +62,13 @@ from database import (
     route_and_save_bg,
 )
 from logic import handle_local_queries
+from media_processor import (
+    MediaValidationError,
+    VideoRateLimitError,
+    process_document,
+    process_image,
+    process_video,
+)
 from web_channel.search_tools import SearchResult, search_enabled, search_many
 from web_channel.sse_utils import SSE_HEADERS, SSE_MEDIA_TYPE, sse_event
 from web_channel.stream_ai import AIServiceError, groq_complete, groq_stream
@@ -118,13 +126,23 @@ def clean_web_message(text: str) -> str:
 
 
 class ChatRequest(BaseModel):
-    """Body of ``POST /api/chat``. Invalid input yields FastAPI's normal 422."""
+    """Body of ``POST /api/chat`` and ``POST /api/app/chat``. Invalid input
+    yields FastAPI's normal 422."""
 
     message: str
-    channel: Literal["web"] = "web"
+    channel: Literal["web", "app"] = "web"
     session_id: str = Field(..., pattern=_SESSION_ID_PATTERN)
     conversation_id: str = Field(..., pattern=_CONVERSATION_ID_PATTERN)
-    images: Optional[list[dict]] = None  # accepted and ignored for now
+    # Each image may be a plain base64 string, or a dict carrying it under
+    # "data" or "url" (see _extract_image_payloads). Validated/compressed
+    # via media_processor.process_image before ever reaching the model.
+    images: Optional[list[Any]] = None
+    # Base64-encoded video clip (max ~5s / 3MB; rate-limited to 1/second
+    # per session by media_processor.process_video).
+    video: Optional[str] = None
+    # {"filename": str, "data": <base64>}; extracted via
+    # media_processor.process_document.
+    document: Optional[dict] = None
 
     @field_validator("message")
     @classmethod
@@ -247,6 +265,7 @@ async def _plan_search(message: str, history_key: str) -> list[str]:
             max_tokens=WEB_PLANNER_MAX_TOKENS,
             temperature=0,
             timeout=_PLANNER_TIMEOUT_SECONDS,
+            strip_reasoning=False,
         )
         if not (raw or "").strip():
             logger.info("planner returned empty output")
@@ -290,13 +309,123 @@ def _save_long_term(web_session: str, message: str, reply: str) -> None:
         logger.warning("Long-term save failed (%s)", type(exc).__name__)
 
 
+# --- Media processing (shared by POST /api/chat and POST /api/app/chat) -----
+
+def _extract_image_payloads(images: Optional[list[Any]]) -> list[Any]:
+    """Normalize ChatRequest.images into a flat list of raw payloads that
+    media_processor.process_image can decode.
+
+    Each item may be a plain base64 string, or a dict carrying it under
+    "data" or "url". Any item that doesn't match one of those shapes is
+    skipped (never raised on) - one malformed entry in a batch shouldn't
+    fail the whole request.
+
+    NOTE: a "url" entry is passed through as-is. media_processor.
+    process_image only decodes raw bytes / a base64 string / a
+    PIL.Image - it does not fetch remote URLs - so an actual remote URL
+    (rather than a data: URI) will fail validation in _process_media
+    below and simply be skipped, exactly like any other bad image.
+    """
+    if not images:
+        return []
+    payloads: list[Any] = []
+    for item in images:
+        if isinstance(item, str):
+            payloads.append(item)
+        elif isinstance(item, dict):
+            payload = item.get("data") or item.get("url")
+            if isinstance(payload, str):
+                payloads.append(payload)
+    return payloads
+
+
+class _MediaProcessingError(Exception):
+    """Internal signal that video or document validation failed.
+
+    Carries the exact safe, user-facing message media_processor raised,
+    plus the HTTP status code the JSON endpoint (POST /api/app/chat)
+    should return for it - 429 for a video rate limit, 400 for any other
+    validation failure. The SSE endpoint (POST /api/chat) only ever uses
+    `.message` (as an "error" event); HTTP status codes don't apply to an
+    already-open SSE stream.
+    """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        """Store the safe message and the status code to report it with."""
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+async def _process_media(
+    images: Optional[list[Any]],
+    video: Optional[str],
+    document: Optional[dict],
+    session_id: str,
+    sid: str,
+) -> tuple[list[Any], Optional[list[Any]], Optional[str]]:
+    """Validate/compress images, a video clip, and a document via
+    media_processor.py, shared by both POST /api/chat (SSE) and POST
+    /api/app/chat (JSON).
+
+    Returns (processed_images, processed_video_frames, document_text).
+    `processed_images` is always a (possibly empty) list; a single image
+    that fails validation is skipped and logged, never raised - one bad
+    image in a batch must not fail the whole request. `document_text` is
+    the extracted, already length-capped text, or None if no document was
+    given.
+
+    Raises:
+        _MediaProcessingError: if the video or document fails validation
+            - VideoRateLimitError becomes status_code=429, everything
+            else (MediaValidationError, or a bad/undecodable document
+            payload) becomes status_code=400. Callers decide how to
+            surface `.message` (an SSE "error" event, or a JSON error
+            response with `.status_code`).
+    """
+    processed_images: list[Any] = []
+    for payload in _extract_image_payloads(images):
+        try:
+            processed_images.append(await asyncio.to_thread(process_image, payload))
+        except MediaValidationError as exc:
+            logger.warning("Skipping an image that failed validation (session=%s): %s", sid, exc)
+
+    processed_video_frames: Optional[list[Any]] = None
+    if video:
+        try:
+            processed_video_frames = await asyncio.to_thread(process_video, video, session_id)
+        except VideoRateLimitError as exc:
+            raise _MediaProcessingError(str(exc), 429) from exc
+        except MediaValidationError as exc:
+            raise _MediaProcessingError(str(exc), 400) from exc
+
+    document_text: Optional[str] = None
+    if document:
+        filename = (document or {}).get("filename") or "document"
+        doc_b64 = (document or {}).get("data") or ""
+        try:
+            doc_bytes = base64.b64decode(doc_b64) if doc_b64 else b""
+            document_text = await asyncio.to_thread(process_document, doc_bytes, filename)
+        except MediaValidationError as exc:
+            raise _MediaProcessingError(str(exc), 400) from exc
+        except Exception as exc:  # noqa: BLE001 - a bad payload must never 500
+            logger.warning(
+                "Failed to decode document payload (session=%s): %s", sid, type(exc).__name__
+            )
+            raise _MediaProcessingError("Could not read the attached document.", 400) from exc
+
+    return processed_images, processed_video_frames, document_text
+
+
 async def _event_stream(
     request: Request,
     message: str,
     session_id: str,
     conversation_id: str,
-    has_images: bool,
     slot: _StreamSlot,
+    images: Optional[list[Any]] = None,
+    video: Optional[str] = None,
+    document: Optional[dict] = None,
 ) -> AsyncIterator[str]:
     """Generate the SSE events for one chat request.
 
@@ -311,13 +440,29 @@ async def _event_stream(
 
     try:
         yield sse_event("status", {"text": "Thinking..."})
-        if has_images:
-            yield sse_event("status", {"text": "Image understanding is not available yet."})
+
+        # 0) Media processing: images/video/document are validated and
+        # compressed via media_processor.py before anything else - a
+        # rejected video/document is reported cleanly and ends the
+        # stream; a single bad image is just skipped (see _process_media).
+        if video:
+            yield sse_event("status", {"text": "Processing video frames..."})
+        try:
+            processed_images, processed_video_frames, document_text = await _process_media(
+                images, video, document, session_id, sid
+            )
+        except _MediaProcessingError as exc:
+            yield sse_event("error", {"text": exc.message})
+            return
+
+        has_media = bool(processed_images or processed_video_frames or document_text)
 
         # 1) Local shortcut (date, time, simple maths): no AI call needed.
+        # Never used for a turn carrying an image, video, or document -
+        # a canned local answer would silently ignore them.
         local = (
             await asyncio.to_thread(handle_local_queries, message)
-            if WEB_LOCAL_SHORTCUTS
+            if (WEB_LOCAL_SHORTCUTS and not has_media)
             else None
         )
         if local is not None:
@@ -366,12 +511,20 @@ async def _event_stream(
         # 4) Stream the answer.
         yield sse_event("status", {"text": "Writing the answer..."})
         base = await asyncio.to_thread(build_groq_messages, "", history_key)
-        messages = build_answer_messages(base, long_term_context, sources)
+        messages = build_answer_messages(
+            base, long_term_context, sources, document_context=document_text or ""
+        )
 
         parts: list[str] = []
         chunk_count = 0
         timed_out = False
-        stream = groq_stream(messages, max_tokens=WEB_MAX_TOKENS, temperature=WEB_TEMPERATURE)
+        stream = groq_stream(
+            messages,
+            max_tokens=WEB_MAX_TOKENS,
+            temperature=WEB_TEMPERATURE,
+            images=processed_images or None,
+            video_frames=processed_video_frames,
+        )
         async with aclosing(stream):
             while True:
                 remaining = deadline - time.monotonic()
@@ -447,8 +600,9 @@ async def chat(body: ChatRequest, request: Request):
     slot = _StreamSlot(_stream_semaphore)
 
     logger.info(
-        "Web chat request (session=%s, chars=%d, images=%s)",
-        _short_id(body.session_id), len(body.message), bool(body.images),
+        "Web chat request (session=%s, channel=%s, chars=%d, images=%s, video=%s, document=%s)",
+        _short_id(body.session_id), body.channel, len(body.message),
+        bool(body.images), bool(body.video), bool(body.document),
     )
 
     generator = _event_stream(
@@ -456,8 +610,10 @@ async def chat(body: ChatRequest, request: Request):
         message=body.message,
         session_id=body.session_id,
         conversation_id=body.conversation_id,
-        has_images=bool(body.images),
         slot=slot,
+        images=body.images,
+        video=body.video,
+        document=body.document,
     )
     return StreamingResponse(
         generator,
@@ -466,6 +622,130 @@ async def chat(body: ChatRequest, request: Request):
         # Safety net: frees the slot even if the generator never got to run.
         background=BackgroundTask(slot.release),
     )
+
+
+@router.post("/app/chat")
+async def app_chat(body: ChatRequest, request: Request):
+    """Non-streaming JSON chat endpoint for app clients (mobile/desktop)
+    that prefer one structured response over SSE.
+
+    Applies the same rate limiting, media processing (images/video/
+    document via media_processor.py), memory retrieval, optional web
+    search, and generation as POST /api/chat - just returned as a single
+    JSON object instead of incremental SSE events.
+
+    Returns:
+        200 {"status": "ok", "reply": ..., "emotion": ..., "sources": [...]}
+        400 {"status": "error", "error": ...} - invalid image/video/document
+        429 {"status": "error", "error": ...} - rate limited, or a video's
+            1-per-second limit was hit
+        502 {"status": "error", "error": ...} - the AI service failed or
+            returned nothing usable
+        500 {"status": "error", "error": ...} - any other unexpected error
+    """
+    ip = _client_ip(request)
+    if _request_is_rate_limited(ip, body.session_id):
+        return JSONResponse(
+            {"status": "error", "error": _MSG_TOO_MANY},
+            status_code=429,
+            headers={"Retry-After": "30"},
+        )
+
+    if _stream_semaphore.locked():
+        return JSONResponse({"status": "error", "error": _MSG_BUSY}, status_code=503)
+    await _stream_semaphore.acquire()
+    slot = _StreamSlot(_stream_semaphore)
+
+    sid = _short_id(body.session_id)
+    web_session = f"web_{body.session_id}"
+    history_key = f"{web_session}:{body.conversation_id}"
+
+    logger.info(
+        "App chat request (session=%s, channel=%s, chars=%d, images=%s, video=%s, document=%s)",
+        sid, body.channel, len(body.message),
+        bool(body.images), bool(body.video), bool(body.document),
+    )
+
+    try:
+        try:
+            processed_images, processed_video_frames, document_text = await _process_media(
+                body.images, body.video, body.document, body.session_id, sid
+            )
+        except _MediaProcessingError as exc:
+            return JSONResponse(
+                {"status": "error", "error": exc.message}, status_code=exc.status_code
+            )
+
+        has_media = bool(processed_images or processed_video_frames or document_text)
+
+        # 1) Local shortcut - same conditions as the SSE path.
+        local = (
+            await asyncio.to_thread(handle_local_queries, body.message)
+            if (WEB_LOCAL_SHORTCUTS and not has_media)
+            else None
+        )
+        if local is not None:
+            tag, sep, text = local.partition("|")
+            if not sep:
+                tag, text = "NORMAL", local
+            emotion = tag.strip().upper() or "NORMAL"
+            await asyncio.to_thread(add_to_history, "user", body.message, history_key)
+            await asyncio.to_thread(add_to_history, "model", text, history_key)
+            _save_long_term(web_session, body.message, text)
+            logger.info("App chat answered locally (session=%s)", sid)
+            return {"status": "ok", "reply": text, "emotion": emotion, "sources": []}
+
+        # 2) Memory and history.
+        long_term_context = await asyncio.to_thread(
+            retrieve_long_term_context, body.message, web_session
+        )
+        await asyncio.to_thread(add_to_history, "user", body.message, history_key)
+
+        # 3) Optional web search.
+        sources: list[SearchResult] = []
+        if search_enabled():
+            queries = await _plan_search(body.message, history_key)
+            if queries:
+                sources = await _collect_sources(queries)
+
+        # 4) Generate the answer (non-streaming).
+        base = await asyncio.to_thread(build_groq_messages, "", history_key)
+        messages = build_answer_messages(
+            base, long_term_context, sources, document_context=document_text or ""
+        )
+
+        try:
+            final_text = await groq_complete(
+                messages,
+                max_tokens=WEB_MAX_TOKENS,
+                temperature=WEB_TEMPERATURE,
+                timeout=WEB_STREAM_TIMEOUT_SECONDS,
+                images=processed_images or None,
+                video_frames=processed_video_frames,
+            )
+        except AIServiceError as exc:
+            logger.warning("AI service error in app chat (session=%s)", sid)
+            return JSONResponse({"status": "error", "error": exc.user_message}, status_code=502)
+
+        if not (final_text or "").strip():
+            logger.warning("AI returned an empty reply (session=%s)", sid)
+            return JSONResponse({"status": "error", "error": _MSG_EMPTY}, status_code=502)
+
+        await asyncio.to_thread(add_to_history, "model", final_text, history_key)
+        _save_long_term(web_session, body.message, final_text)
+        logger.info("App chat finished (session=%s, sources=%d)", sid, len(sources))
+
+        return {
+            "status": "ok",
+            "reply": final_text,
+            "emotion": "NORMAL",
+            "sources": [{"title": s.title, "url": s.url, "domain": s.domain} for s in sources],
+        }
+    except Exception:
+        logger.exception("Unexpected error in app chat (session=%s)", sid)
+        return JSONResponse({"status": "error", "error": _MSG_GENERIC}, status_code=500)
+    finally:
+        slot.release()
 
 
 @router.get("/health")
