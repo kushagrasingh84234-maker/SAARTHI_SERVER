@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from cachetools import TTLCache
 
 from config import (
@@ -35,6 +36,10 @@ from database import (
     build_groq_messages, CHAT_HISTORY, SUPABASE_ENABLED, ADVANCED_DB_ENABLED,
     save_personalization_profile_bg,
 )
+from storage.db_config import init_all_databases
+from storage.robot_layer1_buffer import robot_layer1_buffer
+from storage.robot_layer2_filter import flush_all_ready_robots
+from storage.layer3_monthly_cleaner import run_full_layer3_cleanup
 
 # IMPROVEMENT: added timestamp/logger-name to the default format for easier
 # correlation of related log lines when reading Render's log stream.
@@ -135,8 +140,57 @@ def _persist_personalization_bg(session_id: str) -> None:
         logger.warning(f"Skipping personalization persistence for session_id={session_id}: {e}")
 
 
+_LAYER2_FLUSH_INTERVAL_SEC = 60.0
+_LAYER1_CLEANUP_INTERVAL_SEC = 1800.0  # 30 minutes
+_LAYER1_MAX_IDLE_SEC = 1800.0
+
+# Populated once at startup by lifespan() from init_all_databases(); reported
+# as-is by /health (it reflects startup-time storage connectivity/schema
+# status, not a live re-check on every request).
+_storage_status: dict = {}
+
+
+async def _layer2_flush_loop() -> None:
+    """Background loop: every 60s, filter+persist each robot's newly
+    accumulated Layer 1 telemetry (storage/robot_layer2_filter). Runs in a
+    worker thread so the blocking DB writes never stall the event loop.
+    Never dies on an error - it logs and keeps looping."""
+    while True:
+        try:
+            await asyncio.sleep(_LAYER2_FLUSH_INTERVAL_SEC)
+            results = await asyncio.to_thread(
+                flush_all_ready_robots, flush_interval_sec=_LAYER2_FLUSH_INTERVAL_SEC
+            )
+            if results:
+                logger.info(f"Layer 2 flush: processed {len(results)} robot(s).")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Layer 2 flush loop error: {e}")
+
+
+async def _layer1_cleanup_loop() -> None:
+    """Background loop: every 30 minutes, evict robots idle for more than
+    30 minutes from the Layer 1 RAM buffer so memory stays bounded. Never
+    dies on an error - it logs and keeps looping."""
+    while True:
+        try:
+            await asyncio.sleep(_LAYER1_CLEANUP_INTERVAL_SEC)
+            evicted = await asyncio.to_thread(
+                robot_layer1_buffer.cleanup_inactive_robots,
+                max_idle_seconds=_LAYER1_MAX_IDLE_SEC,
+            )
+            if evicted:
+                logger.info(f"Layer 1 cleanup: evicted {len(evicted)} inactive robot(s).")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Layer 1 cleanup loop error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _storage_status
     logger.info("Server starting up.")
     logger.info(f"Groq model: {GROQ_MODEL} | Supabase enabled: {SUPABASE_ENABLED} | "
                 f"Advanced vector memory enabled: {ADVANCED_DB_ENABLED} | "
@@ -145,6 +199,22 @@ async def lifespan(app: FastAPI):
         f"Web channel enabled: {WEB_ENABLED} | Search provider: {SEARCH_PROVIDER} | "
         f"Allowed origins: {len(ALLOWED_ORIGINS)}"
     )
+
+    # NEW: 3-layer storage. init_all_databases() is documented as never
+    # raising, but is wrapped anyway - storage problems must never stop
+    # the server from starting.
+    try:
+        _storage_status = await asyncio.to_thread(init_all_databases)
+        logger.info(f"Storage initialized: {_storage_status}")
+    except Exception as e:
+        _storage_status = {"error": f"init failed: {e}"}
+        logger.error(f"Storage initialization failed (server continues without it): {e}")
+
+    # NEW: non-blocking background maintenance loops.
+    background_tasks = [
+        asyncio.create_task(_layer2_flush_loop()),
+        asyncio.create_task(_layer1_cleanup_loop()),
+    ]
 
     # NEW: optional GPU warm-up. Off by default (lazy-loads on first
     # request instead, via ai_services.load_saarthi_model()'s own
@@ -163,6 +233,12 @@ async def lifespan(app: FastAPI):
             )
 
     yield
+
+    # NEW: stop the storage background loops cleanly on shutdown.
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
+
     # IMPROVEMENT: surface in-memory state size on shutdown, useful when
     # correlating a Render restart/deploy with how much session state existed
     # at the time.
@@ -247,9 +323,16 @@ async def _run_ai_pipeline(
     # build_messages_fn closure captures the already-fetched
     # long_term_context so logic.py's pipeline never has to perform its
     # own blocking Supabase lookup inside the event loop.
+    #
+    # NOTE: this deliberately returns plain build_groq_messages() output.
+    # run_personalized_pipeline already applies the robot-control system
+    # prompt and folds in document_text ITSELF after calling this
+    # function; doing it here as well would merge the attached document
+    # into the system message twice. (_apply_robot_context_to_messages is
+    # only for the personalization-disabled fallback below, which has no
+    # such post-processing.)
     def _build_messages(sid: str, _msg: str):
-        msgs = build_groq_messages(long_term_context, sid)
-        return _apply_robot_context_to_messages(msgs, _msg, sensor_data, document_text, mode)
+        return build_groq_messages(long_term_context, sid)
 
     if PERSONALIZATION_ENABLED:
         try:
@@ -379,6 +462,33 @@ def _ensure_full_response_shape(result: dict) -> dict:
     return result
 
 
+async def _record_robot_telemetry(
+    robot_id: str,
+    sensor_data: Optional[Dict[str, Any]],
+    user_message: str,
+    action_taken: Optional[dict],
+    error_flag: bool = False,
+    error_reason: str = "",
+) -> None:
+    """Best-effort write of one telemetry packet into the Layer 1 rolling
+    buffer (storage/robot_layer1_buffer). Never raises - a Layer 1
+    recording failure must never turn into a second error on top of
+    whatever the robot was already doing. Run in a worker thread so the
+    per-robot lock never blocks the event loop."""
+    try:
+        await asyncio.to_thread(
+            robot_layer1_buffer.record_telemetry,
+            robot_id=robot_id,
+            sensor_data=sensor_data or {},
+            user_message=user_message or "",
+            action_taken=action_taken,
+            error_flag=error_flag,
+            error_reason=error_reason,
+        )
+    except Exception as e:
+        logger.warning(f"Layer 1: failed to record telemetry for robot_id={robot_id}: {e}")
+
+
 async def _process_chat_message(
     user_message: str,
     session_id: str,
@@ -470,6 +580,11 @@ async def _process_chat_message(
             )
         except Exception as e:
             logger.error(f"Groq call failed after retries: {e}")
+            if is_robot_or_media_turn:
+                await _record_robot_telemetry(
+                    session_id, sensor_data, user_message, None,
+                    error_flag=True, error_reason=f"AI pipeline failed: {e}",
+                )
             return _build_response_dict("SAD|My brain is offline right now, try again in a bit.")
 
         if cache_key is not None:
@@ -482,6 +597,20 @@ async def _process_chat_message(
                 response_cache[cache_key] = raw_reply
 
     result = _build_response_dict(raw_reply)
+
+    # NEW: Layer 1 telemetry. Every robot-control/media turn (sensor_data,
+    # images, video, document, or mode="robot_control") is recorded into
+    # the per-robot rolling 15-minute buffer along with whatever [ACTION]
+    # the model returned (None if it didn't return one). This is
+    # deliberately NOT limited to turns that produced an action: Layer 1
+    # is meant to hold the robot's continuous stream so Layer 2 can spot
+    # quiet vs. eventful periods, and skipping action-less turns would
+    # leave gaps in that window. The robot_id is the session_id - that is
+    # what identifies a robot on /ws/{session_id}.
+    if is_robot_or_media_turn:
+        await _record_robot_telemetry(
+            session_id, sensor_data, user_message, result.get("action")
+        )
 
     await asyncio.to_thread(add_to_history, "model", result["text"] or raw_reply, session_id)
     await asyncio.to_thread(route_and_save_bg, "user", user_message, session_id)
@@ -590,6 +719,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         process_video, raw_video, effective_session_id
                     )
                 except (VideoRateLimitError, MediaValidationError) as e:
+                    if mode == "robot_control":
+                        await _record_robot_telemetry(
+                            effective_session_id, sensor_data, user_message, None,
+                            error_flag=True, error_reason=f"Video rejected: {e}",
+                        )
                     await websocket.send_json({
                         "type": "error",
                         "emotion": "SAD",
@@ -609,6 +743,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     doc_bytes = base64.b64decode(doc_b64) if doc_b64 else b""
                     document_text = await asyncio.to_thread(process_document, doc_bytes, filename)
                 except MediaValidationError as e:
+                    if mode == "robot_control":
+                        await _record_robot_telemetry(
+                            effective_session_id, sensor_data, user_message, None,
+                            error_flag=True, error_reason=f"Document rejected: {e}",
+                        )
                     await websocket.send_json({
                         "type": "error",
                         "emotion": "SAD",
@@ -619,6 +758,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     logger.warning(
                         f"Failed to decode document payload for session_id={session_id}: {e}"
                     )
+                    if mode == "robot_control":
+                        await _record_robot_telemetry(
+                            effective_session_id, sensor_data, user_message, None,
+                            error_flag=True, error_reason="Document could not be decoded",
+                        )
                     await websocket.send_json({
                         "type": "error",
                         "emotion": "SAD",
@@ -671,6 +815,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 )
             except Exception as e:
                 logger.exception(f"Unhandled error processing message for session_id={session_id}: {e}")
+                if mode == "robot_control" or sensor_data:
+                    await _record_robot_telemetry(
+                        effective_session_id, sensor_data, user_message, None,
+                        error_flag=True, error_reason=f"Unhandled error: {e}",
+                    )
                 await websocket.send_json({
                     "type": "error",
                     "emotion": "SAD",
@@ -728,7 +877,52 @@ async def health():
         "active_websocket_connections": active_ws_count,
         "rate_limit_keys_tracked": rate_limit_keys_tracked,
         "uptime_seconds": round(time.time() - START_TIME, 1),
+        # NEW: 3-layer storage status captured at startup by
+        # init_all_databases() (backend per database + whether schema
+        # creation succeeded, and whether MongoDB is enabled).
+        "storage": _storage_status,
     }
+
+
+# ---- NEW: storage admin / maintenance endpoints ----------------------------
+#
+# SECURITY NOTE: these two endpoints are unauthenticated, like /health. The
+# cleanup endpoint in particular DELETES old rows (after extracting the
+# "golden" 10%), so before exposing this server publicly, put it behind an
+# API key / internal-only network rule / your reverse proxy's auth.
+
+@app.post("/api/storage/cleanup")
+async def storage_cleanup(retention_days: int = 30):
+    """Trigger the Layer 3 monthly cleanup (90% raw-log cleanup, 10%
+    "golden" memory kept) on demand. `retention_days` (query param,
+    default 30) is how old a row must be to be considered. Runs in a
+    worker thread so the DB work never blocks the event loop."""
+    if retention_days < 1:
+        return JSONResponse(
+            {"status": "error", "error": "retention_days must be at least 1"},
+            status_code=400,
+        )
+    try:
+        result = await asyncio.to_thread(run_full_layer3_cleanup, retention_days)
+    except Exception as e:
+        logger.exception(f"Layer 3 cleanup failed: {e}")
+        return JSONResponse(
+            {"status": "error", "error": "Cleanup failed; see server logs."},
+            status_code=500,
+        )
+    return {"status": "ok", "result": result}
+
+
+@app.get("/api/robot/{robot_id}/window")
+async def robot_window(robot_id: str, since_ts: Optional[float] = None):
+    """Return a snapshot of `robot_id`'s current Layer 1 rolling
+    15-minute telemetry window (optionally only packets newer than the
+    `since_ts` query param). An unknown or long-idle robot simply returns
+    an empty list."""
+    packets = await asyncio.to_thread(
+        robot_layer1_buffer.get_robot_window, robot_id, since_ts
+    )
+    return {"robot_id": robot_id, "count": len(packets), "packets": packets}
 
 
 if __name__ == "__main__":
