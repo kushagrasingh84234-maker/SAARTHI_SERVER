@@ -40,6 +40,7 @@ from storage.db_config import init_all_databases
 from storage.robot_layer1_buffer import robot_layer1_buffer
 from storage.robot_layer2_filter import flush_all_ready_robots
 from storage.layer3_monthly_cleaner import run_full_layer3_cleanup
+from storage.chat_layer_manager import record_chat_turn
 
 # IMPROVEMENT: added timestamp/logger-name to the default format for easier
 # correlation of related log lines when reading Render's log stream.
@@ -258,7 +259,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -615,6 +616,19 @@ async def _process_chat_message(
     await asyncio.to_thread(add_to_history, "model", result["text"] or raw_reply, session_id)
     await asyncio.to_thread(route_and_save_bg, "user", user_message, session_id)
     await asyncio.to_thread(route_and_save_bg, "assistant", result["text"] or raw_reply, session_id)
+    if not is_robot_or_media_turn:
+        try:
+            await asyncio.to_thread(
+                record_chat_turn,
+                user_id=session_id,
+                session_id=session_id,
+                channel="robot_ws",
+                user_message=user_message,
+                assistant_reply=result["text"] or raw_reply,
+                intent="chat",
+            )
+        except Exception as e:
+            logger.warning(f"Layer chat record failed for ws session_id={session_id}: {e}")
 
     return result
 

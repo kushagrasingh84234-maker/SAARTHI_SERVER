@@ -18,7 +18,7 @@ saarthi_image = (
         "WEB_MAX_TOKENS": "250",
     })
     .add_local_dir(
-        "/content/SAARTHI_SERVER",
+        "/kaggle/working/SAARTHI_SERVER",
         remote_path="/root/SAARTHI_SERVER",
         ignore=[".git", "__pycache__", "*.log", "*.zip", "local_data", "saarthi_v2_perfect/checkpoint-*"],
     )

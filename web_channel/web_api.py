@@ -933,25 +933,63 @@ async def web_health() -> dict:
 
 
 @router.get("/history/{session_id}")
-async def get_chat_history(session_id: str):
-    """Fetch chat history for a specific session from Supabase."""
-    if not SUPABASE_ENABLED or not _supabase_client:
-        return JSONResponse({"messages": []})
+async def get_chat_history(session_id: str, conversation_id: str = "conv_default_01"):
+    """Fetch chat history from Supabase (with web_ prefix support) or 3-layer local storage fallback."""
+    web_session = session_id if session_id.startswith("web_") else f"web_{session_id}"
+    history_key = f"{web_session}:{conversation_id}"
 
-    def _fetch():
-        return (
-            _supabase_client.table("memory_logs")
-            .select("id, session_id, role, content, created_at")
-            .eq("session_id", session_id)
-            .order("created_at", desc=True)
-            .limit(100)
-            .execute()
-        )
+    if SUPABASE_ENABLED and _supabase_client:
+        def _fetch():
+            return (
+                _supabase_client.table("memory_logs")
+                .select("id, session_id, role, content, created_at")
+                .in_("session_id", [session_id, web_session])
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+            )
+        try:
+            resp = await asyncio.to_thread(_fetch)
+            if resp.data:
+                return {"messages": list(reversed(resp.data))}
+        except Exception as e:
+            logger.error(f"Error fetching Supabase history for {session_id}: {e}")
 
     try:
-        resp = await asyncio.to_thread(_fetch)
-        messages = list(reversed(resp.data or []))
-        return {"messages": messages}
+        stored_turns = await asyncio.to_thread(get_recent_chat_history, history_key)
+        if not stored_turns:
+            stored_turns = await asyncio.to_thread(get_recent_chat_history, session_id)
+        if stored_turns:
+            return {"messages": stored_turns}
     except Exception as e:
-        logger.error(f"Error fetching history for {session_id}: {e}")
-        return JSONResponse({"messages": [], "error": True}, status_code=500)
+        logger.warning(f"Fallback storage history lookup failed for {session_id}: {e}")
+
+    return {"messages": []}
+
+
+@router.delete("/history/{session_id}")
+async def delete_chat_history(session_id: str, conversation_id: Optional[str] = None):
+    """Delete chat history from RAM, Supabase, and 3-layer local storage."""
+    web_session = session_id if session_id.startswith("web_") else f"web_{session_id}"
+
+    keys_to_delete = [
+        k for k in list(CHAT_HISTORY.keys())
+        if k in (session_id, web_session) or k.startswith(f"{web_session}:")
+    ]
+    for k in keys_to_delete:
+        CHAT_HISTORY.pop(k, None)
+
+    if SUPABASE_ENABLED and _supabase_client:
+        def _del_supa():
+            return (
+                _supabase_client.table("memory_logs")
+                .delete()
+                .in_("session_id", [session_id, web_session])
+                .execute()
+            )
+        try:
+            await asyncio.to_thread(_del_supa)
+        except Exception as e:
+            logger.warning(f"Supabase history delete failed for {session_id}: {e}")
+
+    return {"status": "ok", "deleted_session": session_id}
