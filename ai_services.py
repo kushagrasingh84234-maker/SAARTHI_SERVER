@@ -326,6 +326,9 @@ def load_saarthi_model():
             load_kwargs["device_map"] = "auto"
         elif use_cuda:
             load_kwargs["device_map"] = "auto"
+        else:
+            load_kwargs["torch_dtype"] = torch.bfloat16
+            load_kwargs["low_cpu_mem_usage"] = True
 
         base_model = _SaarthiModelClass.from_pretrained(BASE_MODEL_ID, **load_kwargs)
 
